@@ -5,13 +5,74 @@
 
 namespace mobilinkd
 {
+    // =========================================================================
+    // AUDIO PARAMETERS (unchanged)
+    // =========================================================================
+    
     const int opus_bitrate = 16000;         // target output bit rate from voice encoder
-
-    const int audio_sample_rate = 48000;     // 16-bit PCM samples per second for audio signals
-
-    const int audio_samples_per_opv_frame = audio_sample_rate * 0.04;  // PCM samples per audio frame (two codec frames)
+    const int audio_sample_rate = 48000;    // 16-bit PCM samples per second for audio signals
+    const int audio_samples_per_opv_frame = audio_sample_rate * 0.04;  // PCM samples per 40ms frame
     const int audio_bytes_per_opv_frame = audio_samples_per_opv_frame * 2;  // 2 bytes per PCM sample
 
+    // =========================================================================
+    // NEW OPV CONSTANTS (HDL-aligned, pluto_msk compatible)
+    // =========================================================================
+    // These constants match the FPGA reference implementation.
+    // Use these for new code; legacy constants below are for migration only.
+    
+    // --- Frame Structure ---
+    const int opv_header_bytes = 12;                // OPV frame header (callsign, token, flags)
+    const int opv_payload_bytes = 122;              // OPV payload (Opus audio, BERT, text, data)
+    const int opv_frame_bytes = 134;                // Total frame before FEC (header + payload)
+    const int opv_frame_bits = opv_frame_bytes * 8; // 1072 bits
+    
+    // --- After FEC (K=7, rate 1/2 convolutional) ---
+    const int opv_encoded_bytes = 268;              // 134 * 2 after rate-1/2 encoding
+    const int opv_encoded_bits = 2144;              // 268 * 8 = 67 * 32 (matches interleaver)
+    
+    // --- Sync Word ---
+    const int opv_sync_word = 0x02B8DB;             // 24-bit sync word (PSLR optimized)
+    const int opv_sync_bits = 24;
+    const int opv_sync_bytes = 3;
+    
+    // --- Row-Column Interleaver (67 x 32) ---
+    const int opv_interleaver_rows = 67;
+    const int opv_interleaver_cols = 32;
+    // Note: 67 * 32 = 2144 bits = opv_encoded_bits (must match!)
+    
+    // --- NASA/Voyager K=7 Convolutional Code ---
+    const int opv_conv_K = 7;                       // Constraint length (64 states)
+    const int opv_conv_G1 = 0171;                   // Generator 1: 171 octal = 0x79
+    const int opv_conv_G2 = 0133;                   // Generator 2: 133 octal = 0x5B
+    
+    // --- Derived timing constants ---
+    const int opv_total_frame_bits = opv_sync_bits + opv_encoded_bits;  // 24 + 2144 = 2168 bits
+    const int opv_frame_period_ms = 40;             // 40ms per frame
+    
+    // --- BERT (Bit Error Rate Test) ---
+    const int opv_bert_payload_bits = opv_payload_bytes * 8;  // 976 bits
+    const int opv_bert_prime_size = 971;            // Largest prime < 976 for PRBS cycling
+    
+    // --- Static assertions for new constants ---
+    static_assert(opv_interleaver_rows * opv_interleaver_cols == opv_encoded_bits,
+                  "Interleaver dimensions must match encoded frame size");
+    static_assert(opv_frame_bytes == opv_header_bytes + opv_payload_bytes,
+                  "Frame size must equal header + payload");
+    static_assert(opv_encoded_bytes == opv_frame_bytes * 2,
+                  "Encoded size must be 2x frame size (rate 1/2)");
+    static_assert(opv_bert_prime_size < opv_bert_payload_bits,
+                  "BERT prime must be smaller than payload");
+    
+    // =========================================================================
+    // LEGACY CONSTANTS (M17 heritage - for migration, will be removed)
+    // =========================================================================
+    // WARNING: These constants are from the old architecture which used:
+    //   - Golay encoding for header (separate from payload)
+    //   - K=5 convolutional code (not K=7)
+    //   - Polynomial interleaver (not row-column)
+    //   - Randomizer applied AFTER interleaving (should be BEFORE FEC)
+    // Do not use these for new code!
+    
     // (converting to) COBS/RDP/UDP/IP Frame Format for OPUlent Voice
     const int fheader_size_bytes = 12;        // bytes in a frame header (multiple of 3 for Golay encoding)
     const int encoded_fheader_size = fheader_size_bytes * 8 * 2;    // bits in an encoded frame header
@@ -58,14 +119,11 @@ namespace mobilinkd
     static_assert(bert_frame_prime_size % 37 != 0, "BERT prime size not prime");
     static_assert(bert_frame_prime_size % 41 != 0, "BERT prime size not prime");
 
-    // This interleaver polynomial was chosen by brute force search (see MATLAB
-    // live script OpulentVoiceNumerology.mlx) and has a "minimum interleaving distance"
-    // of 64 bits over a frame of 2152 bits (stream_type4_size). The theoretical
-    // upper bound is 65 bits.
+    // LEGACY: Polynomial interleaver coefficients (replaced by row-column interleaver)
     const int PolynomialInterleaverX = 59;
     const int PolynomialInterleaverX2 = 1076;
 
-    // This convolutional coder was adopted from M17.
+    // LEGACY: M17 convolutional code (replaced by NASA/Voyager K=7)
     const int ConvolutionPolyA = 031;   // octal representation of taps
     const int ConvolutionPolyB = 027;   // octal representation of taps
 
