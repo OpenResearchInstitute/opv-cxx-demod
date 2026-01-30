@@ -1,151 +1,100 @@
-// Copyright 2020 Mobilinkd LLC.
-// Copyright 2022-2026 Open Research Institute, Inc.
-//
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 #pragma once
+// OPVRandomizer.h - LFSR Randomizer matching ORI HDL implementation
+// Polynomial: x^8 + x^7 + x^5 + x^3 + 1
+// Taps: bits 7, 6, 4, 2 (as implemented in ov_frame_encoder.vhd)
+// First 5 bytes: FF 1A AF 66 52
 
 #include <array>
 #include <cstdint>
 #include <cstddef>
 
-namespace mobilinkd
-{
+namespace mobilinkd {
+
+// Pre-computed LFSR sequence (255 bytes max period) matching HDL implementation
+// Generated with taps at bits 7, 6, 4, 2 (matches ov_frame_encoder.vhd)
+inline constexpr std::array<uint8_t, 255> CCSDS_LFSR_TABLE = {{
+    0xff, 0x1a, 0xaf, 0x66, 0x52, 0x23, 0x1e, 0x10, 0xa0, 0xf9, 0xfa, 0x8a, 0x98, 0x67, 0x7d, 0xd2,
+    0xb4, 0xe6, 0xc5, 0xdb, 0xcb, 0x6b, 0x92, 0x68, 0xe2, 0x7a, 0x1d, 0x60, 0xb2, 0x06, 0xe0, 0x25,
+    0xfe, 0x35, 0x5e, 0xcc, 0xa4, 0x46, 0x3c, 0x21, 0x41, 0xf3, 0xf5, 0x15, 0x30, 0xce, 0xfb, 0xa5,
+    0x69, 0xcd, 0x8b, 0xb7, 0x96, 0xd7, 0x24, 0xd1, 0xc4, 0xf4, 0x3a, 0xc1, 0x64, 0x0d, 0xc0, 0x4b,
+    0xfc, 0x6a, 0xbd, 0x99, 0x48, 0x8c, 0x78, 0x42, 0x83, 0xe7, 0xea, 0x2a, 0x61, 0x9d, 0xf7, 0x4a,
+    0xd3, 0x9b, 0x17, 0x6f, 0x2d, 0xae, 0x49, 0xa3, 0x89, 0xe8, 0x75, 0x82, 0xc8, 0x1b, 0x80, 0x97,
+    0xf8, 0xd5, 0x7b, 0x32, 0x91, 0x18, 0xf0, 0x85, 0x07, 0xcf, 0xd4, 0x54, 0xc3, 0x3b, 0xee, 0x95,
+    0xa7, 0x36, 0x2e, 0xde, 0x5b, 0x5c, 0x93, 0x47, 0x13, 0xd0, 0xeb, 0x05, 0x90, 0x37, 0x01, 0x2f,
+    0xf1, 0xaa, 0xf6, 0x65, 0x22, 0x31, 0x0f, 0x08, 0x50, 0x7c, 0xfd, 0x45, 0x4c, 0xb3, 0xbe, 0x69,
+    0x5a, 0x73, 0xe2, 0xed, 0xe5, 0x35, 0x49, 0x34, 0x71, 0xbd, 0x0e, 0xb0, 0x59, 0x03, 0x70, 0x12,
+    0xff, 0x1a, 0xaf, 0x66, 0x52, 0x23, 0x1e, 0x10, 0xa0, 0xf9, 0xfa, 0x8a, 0x98, 0x67, 0x7d, 0xd2,
+    0xb4, 0xe6, 0xc5, 0xdb, 0xcb, 0x6b, 0x92, 0x68, 0xe2, 0x7a, 0x1d, 0x60, 0xb2, 0x06, 0xe0, 0x25,
+    0xfe, 0x35, 0x5e, 0xcc, 0xa4, 0x46, 0x3c, 0x21, 0x41, 0xf3, 0xf5, 0x15, 0x30, 0xce, 0xfb, 0xa5,
+    0x69, 0xcd, 0x8b, 0xb7, 0x96, 0xd7, 0x24, 0xd1, 0xc4, 0xf4, 0x3a, 0xc1, 0x64, 0x0d, 0xc0, 0x4b,
+    0xfc, 0x6a, 0xbd, 0x99, 0x48, 0x8c, 0x78, 0x42, 0x83, 0xe7, 0xea, 0x2a, 0x61, 0x9d, 0xf7, 0x4a,
+    0xd3, 0x9b, 0x17, 0x6f, 0x2d, 0xae, 0x49, 0xa3, 0x89, 0xe8, 0x75, 0x82, 0xc8, 0x1b, 0x80
+}};
 
 /**
- * CCSDS LFSR Randomizer for Opulent Voice Protocol
- * 
- * This implements the standard CCSDS randomizer used for spectral whitening
- * before FEC encoding (and derandomizing after FEC decoding).
- * 
- * Polynomial: x^8 + x^7 + x^5 + x^3 + 1
- * Seed: 0xFF (all ones)
- * Period: 255 bits
- * 
- * The LFSR is reset to 0xFF at the start of each frame.
- * 
- * Reference: CCSDS 131.0-B-3 (TM Synchronization and Channel Coding)
- */
-class CcsdsLfsr
-{
-public:
-    static constexpr uint8_t SEED = 0xFF;
-    
-    CcsdsLfsr() : state_(SEED) {}
-    
-    /// Reset LFSR to initial seed (call at start of each frame)
-    void reset() { state_ = SEED; }
-    
-    /// Clock the LFSR once and return the output bit
-    uint8_t clock()
-    {
-        // Output is MSB
-        uint8_t output = (state_ >> 7) & 1;
-        
-        // Feedback taps: x^8 + x^7 + x^5 + x^3 + 1
-        // In 0-indexed terms: bits 7, 6, 4, 2
-        uint8_t feedback = ((state_ >> 7) ^ (state_ >> 6) ^ (state_ >> 4) ^ (state_ >> 2)) & 1;
-        
-        // Shift left and insert feedback at LSB
-        state_ = ((state_ << 1) | feedback) & 0xFF;
-        
-        return output;
-    }
-    
-    /// Generate 8 output bits (one byte), MSB first
-    uint8_t output_byte()
-    {
-        uint8_t result = 0;
-        for (int i = 7; i >= 0; --i)
-        {
-            result |= (clock() << i);
-        }
-        return result;
-    }
-    
-    /// Get current state (for debugging)
-    uint8_t state() const { return state_; }
-    
-private:
-    uint8_t state_;
-};
-
-
-/**
- * Frame-level randomizer for Opulent Voice
- * 
- * Randomizes/derandomizes a 134-byte frame using CCSDS LFSR.
- * The operation is symmetric (XOR), so the same function is used
- * for both randomization and derandomization.
- * 
- * Usage:
- *   OPVFrameRandomizer randomizer;
- *   randomizer(frame_bytes);  // Randomize before FEC encode
- *   ...
- *   randomizer(decoded_bytes); // Derandomize after FEC decode
- */
-template <size_t N = 134>  // 134 bytes = input frame size before FEC
-class OPVFrameRandomizer
-{
-public:
-    using frame_t = std::array<uint8_t, N>;
-    
-    /// Randomize or derandomize a byte array (same operation)
-    void operator()(frame_t& frame)
-    {
-        lfsr_.reset();
-        for (size_t i = 0; i < N; ++i)
-        {
-            frame[i] ^= lfsr_.output_byte();
-        }
-    }
-    
-    /// Randomize/derandomize with explicit reset
-    void randomize(frame_t& frame)
-    {
-        operator()(frame);
-    }
-    
-    /// Alias for clarity in receive path
-    void derandomize(frame_t& frame)
-    {
-        operator()(frame);
-    }
-    
-private:
-    CcsdsLfsr lfsr_;
-};
-
-
-/**
- * Generate the first N bytes of LFSR output for testing
- * 
- * Test vector (first 10 bytes from seed 0xFF):
- *   0xFF, 0x1A, 0xAF, 0x66, 0x52, 0x23, 0x1E, 0x10, 0xA0, 0xF9
+ * CCSDS LFSR Frame Randomizer/Derandomizer
+ * Used by OPVFrameDecoder - template parameter N is frame size in bytes
  */
 template <size_t N>
-std::array<uint8_t, N> generate_lfsr_sequence()
-{
-    std::array<uint8_t, N> result;
-    CcsdsLfsr lfsr;
-    for (size_t i = 0; i < N; ++i)
-    {
-        result[i] = lfsr.output_byte();
+class OPVFrameRandomizer {
+public:
+    using buffer_t = std::array<uint8_t, N>;
+    
+    /**
+     * Randomize data in place
+     */
+    void randomize(buffer_t& data) {
+        for (size_t i = 0; i < N; ++i) {
+            data[i] ^= CCSDS_LFSR_TABLE[i % 255];
+        }
     }
-    return result;
-}
+    
+    /**
+     * Derandomize data in place (same as randomize - XOR is its own inverse)
+     */
+    void derandomize(buffer_t& data) {
+        randomize(data);
+    }
+};
 
-
-// =============================================================================
-// BACKWARD COMPATIBILITY ALIAS
-// =============================================================================
-// The old code used OPVRandomizer<N> where N was the bit count.
-// This alias allows old code to compile while we migrate.
-// TODO: Remove this once all code is migrated to OPVFrameRandomizer.
-
-template <size_t N_BITS>
-using OPVRandomizer = OPVFrameRandomizer<N_BITS / 8>;
-
-
+/**
+ * Generic CCSDS LFSR Randomizer
+ * Template parameter N is the buffer size in bytes
+ */
+template <size_t N>
+class OPVRandomizer {
+public:
+    using buffer_t = std::array<uint8_t, N>;
+    
+    void operator()(buffer_t& data) {
+        for (size_t i = 0; i < N; ++i) {
+            data[i] ^= CCSDS_LFSR_TABLE[i % 255];
+        }
+    }
+    
+    void operator()(const buffer_t& in, buffer_t& out) {
+        for (size_t i = 0; i < N; ++i) {
+            out[i] = in[i] ^ CCSDS_LFSR_TABLE[i % 255];
+        }
+    }
+};
 
 } // namespace mobilinkd
+
+// Also provide in opvcxx namespace for TX side
+namespace opvcxx {
+
+class OPVRandomizer {
+public:
+    static void randomize(uint8_t* data, size_t len) {
+        for (size_t i = 0; i < len; ++i) {
+            data[i] ^= mobilinkd::CCSDS_LFSR_TABLE[i % 255];
+        }
+    }
+
+    static void derandomize(uint8_t* data, size_t len) {
+        randomize(data, len);
+    }
+};
+
+} // namespace opvcxx

@@ -252,25 +252,27 @@ void output_bitstream_frame(const opv_encoded_t& frame)
 // ENCODING FUNCTIONS
 // =============================================================================
 
-/**
- * Convolutional encode with K=7 NASA/Voyager code
- */
+
+
+
 opv_encoded_t conv_encode_k7(const opv_frame_t& frame)
 {
     opv_encoded_t encoded;
     size_t out_idx = 0;
     uint8_t memory = 0;
     
-    for (auto byte : frame)
+    // FIXED: Iterate bytes in REVERSE order to match HDL
+    // HDL encoder reads from MSB of input buffer, which contains last byte
+    for (int i = frame.size() - 1; i >= 0; --i)
     {
+        auto byte = frame[i];
         for (int bit_idx = 7; bit_idx >= 0; --bit_idx)
         {
             uint8_t input_bit = (byte >> bit_idx) & 1;
             uint8_t state = (input_bit << 6) | memory;
             
-            // G1 = 171 octal = 0x79, G2 = 133 octal = 0x5B
-            uint8_t g1_out = __builtin_parity(state & 0x79);
-            uint8_t g2_out = __builtin_parity(state & 0x5B);
+            uint8_t g1_out = __builtin_parity(state & 0x4F);
+            uint8_t g2_out = __builtin_parity(state & 0x6D);
             
             encoded[out_idx++] = g1_out;
             encoded[out_idx++] = g2_out;
@@ -282,6 +284,13 @@ opv_encoded_t conv_encode_k7(const opv_frame_t& frame)
     return encoded;
 }
 
+
+
+
+/**
+ * Convolutional encode with K=7 NASA/Voyager code
+ */
+
 /**
  * Encode a complete OPV frame
  * Pipeline: combine → randomize → conv encode → interleave
@@ -292,17 +301,43 @@ opv_encoded_t encode_opv_frame(const fheader_t& header, const stream_frame_t& pa
     opv_frame_t frame;
     std::copy(header.begin(), header.end(), frame.begin());
     std::copy(payload.begin(), payload.end(), frame.begin() + opv_header_bytes);
-    
+
+
+    // DEBUG: Show frame BEFORE randomize
+    std::cerr << "Frame before randomize (first 20 bytes): ";
+    for (int i = 0; i < 20; i++) 
+        std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)frame[i] << " ";
+    std::cerr << std::dec << std::endl;
+
     // 2. Randomize
     OPVFrameRandomizer<opv_frame_bytes> randomizer;
     randomizer.randomize(frame);
+
+    // DEBUG: Show frame AFTER randomize  
+    std::cerr << "Frame after randomize (first 20 bytes):  ";
+    for (int i = 0; i < 20; i++) 
+        std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)frame[i] << " ";
+    std::cerr << std::dec << std::endl;
     
     // 3. Convolutional encode
     opv_encoded_t encoded = conv_encode_k7(frame);
+
+
+    // DEBUG: Show first 40 bits after FEC (as 0/1)
+    std::cerr << "[3] After conv encode (first 40 of " << opv_encoded_bits << " bits): ";
+    for (int i = 0; i < 40; i++) 
+        std::cerr << (int)(encoded[i] & 1);
+    std::cerr << std::endl;
     
     // 4. Interleave
     OPVInterleaver interleaver;
     interleaver.interleave(encoded);
+
+    // DEBUG: Show first 40 bits after interleave
+    std::cerr << "[4] After interleave (first 40 bits): ";
+    for (int i = 0; i < 40; i++) 
+        std::cerr << (int)(encoded[i] & 1);
+    std::cerr << std::endl;
     
     return encoded;
 }
@@ -317,24 +352,93 @@ opv_encoded_t encode_opv_frame(const fheader_t& header, const stream_frame_t& pa
  */
 void send_msk_frame(const opv_encoded_t& encoded)
 {
+    static uint64_t frame_num = 0;
+    frame_num++;
+    
+    size_t samples_this_frame = 0;
+    
+    // Debug: dump sync word info
+    std::cerr << "Frame " << frame_num << ": sync=";
+    for (size_t i = 0; i < OPV_SYNC_BITS.size(); ++i)
+    {
+        std::cerr << (int)OPV_SYNC_BITS[i];
+    }
+    std::cerr << " (0x" << std::hex << std::setfill('0') 
+              << std::setw(2) << (int)OPV_SYNC_BYTES[0]
+              << std::setw(2) << (int)OPV_SYNC_BYTES[1]
+              << std::setw(2) << (int)OPV_SYNC_BYTES[2]
+              << std::dec << ")";
+    
     // Modulate sync word (24 bits)
     std::array<OPVMSKModulator::IQSample, OPVMSKModulator::SAMPLES_PER_SYMBOL> symbol_samples;
     for (size_t i = 0; i < OPV_SYNC_BITS.size(); ++i)
     {
         msk_modulator.modulate_bit(OPV_SYNC_BITS[i], symbol_samples);
         output_iq(symbol_samples);
+        samples_this_frame += OPVMSKModulator::SAMPLES_PER_SYMBOL;
     }
-    
-    // Modulate frame data (2144 bits)
-    for (size_t i = 0; i < opv_encoded_bits; ++i)
+
+
+    // Debug: Show first 24 data bits being modulated
+    std::cerr << "[TX] Frame data first 24 bits: ";
+    for (int i = 0; i < 24; i++) {
+        std::cerr << (int)(encoded[i] & 1);
+    }
+    std::cerr << std::endl;
+
+
+
+    // Old way of doing this
+    // Modulate frame data (2144 bits = 268 bytes)
+    //for (size_t i = 0; i < opv_encoded_bits; ++i)
+    //{
+    //    msk_modulator.modulate_bit(encoded[i] & 1, symbol_samples);
+    //    output_iq(symbol_samples);
+    //    samples_this_frame += OPVMSKModulator::SAMPLES_PER_SYMBOL;
+    //}
+
+
+
+    // Modulate frame data (2144 bits = 268 bytes)
+    // Send bits MSB-first within each byte to match HDL byte_to_bit_deserializer
+    for (size_t byte_idx = 0; byte_idx < opv_encoded_bits / 8; ++byte_idx)
     {
-        msk_modulator.modulate_bit(encoded[i] & 1, symbol_samples);
-        output_iq(symbol_samples);
+        // Send bits 7,6,5,4,3,2,1,0 of each 8-bit group
+        for (int bit_pos = 7; bit_pos >= 0; --bit_pos)
+        {
+            size_t i = byte_idx * 8 + bit_pos;
+            msk_modulator.modulate_bit(encoded[i] & 1, symbol_samples);
+            output_iq(symbol_samples);
+            samples_this_frame += OPVMSKModulator::SAMPLES_PER_SYMBOL;
+        }
     }
+
+
+
+    // Debug: Show last 24 data bits modulated
+    std::cerr << "[TX] Frame data last 24 bits:  ";
+    for (int i = opv_encoded_bits - 24; i < (int)opv_encoded_bits; i++) {
+        std::cerr << (int)(encoded[i] & 1);
+    }
+    std::cerr << std::endl;
+
+
+    // Count 1-bits in the data we just transmitted
+    int ones_in_frame = 0;
+    for (size_t i = 0; i < opv_encoded_bits; ++i) {
+        if (encoded[i] & 1) ones_in_frame++;
+    }
+    std::cerr << "[TX] Frame " << frame_num << ": " << ones_in_frame 
+              << " ones in data (" << (ones_in_frame % 2 ? "ODD" : "EVEN") << ")" << std::endl;
+
+
+    
+    // Expected: (24 + 2144) * 40 = 86720 samples
+    std::cerr << " samples=" << samples_this_frame << std::endl;
 }
 
 /**
- * Send stream frame (encode + modulate)
+ * Send stream frame with optional inter-frame preamble
  */
 void send_stream_frame(const fheader_t& header, const stream_frame_t& payload)
 {

@@ -1,81 +1,71 @@
-// Copyright 2026 Open Research Institute, Inc.
-// SPDX-License-Identifier: MIT
-//
-// MSK Modulator for OPV
-//
-// Minimum Shift Keying (MSK) is continuous-phase FSK with h=0.5
-// Each bit shifts phase by ±90° using half-sinusoid shaping
-//
-// Output: Complex I/Q samples for SDR transmission
-
 #pragma once
+// MSKModulator.h - HDL-compatible MSK modulator with differential encoding
+// Matches msk_modulator.vhd exactly
 
 #include <array>
-#include <vector>
-#include <cmath>
 #include <cstdint>
+#include <cmath>
+#include <vector>
 
-namespace mobilinkd {
+namespace opvcxx {
 
 /**
- * MSK Modulator
+ * MSK Modulator matching HDL implementation in msk_modulator.vhd
  * 
- * Converts bits to complex I/Q baseband samples.
- * Uses half-sinusoid frequency pulse for smooth phase transitions.
- *
- * Template parameters:
- *   SamplesPerSymbol - oversampling factor (default 10)
+ * Key parameters (from HDL):
+ *   - Bit rate: 54,200 bps
+ *   - Frame duration: 40 ms (2168 bits per frame)
+ *   - MSK bandwidth: 1.5 × bit_rate = 81.3 kHz
+ * 
+ * Sample rate: 40 samples/bit = 2.168 MSPS (PlutoSDR interpolates to DAC rate)
+ * 
+ * Differential encoding (matches HDL msk_modulator.vhd):
+ *   - bit 0 → d_val = +1
+ *   - bit 1 → d_val = -1
+ *   - symbol = d_val * prev_symbol
+ * 
+ * Phase progression:
+ *   - symbol +1 → phase increases by π/2 (linear ramp)
+ *   - symbol -1 → phase decreases by π/2 (linear ramp)
  */
-template <size_t SamplesPerSymbol = 10>
-class MSKModulator
-{
+template<size_t SamplesPerSymbol = 40>
+class OPVMSKModulator {
 public:
     static constexpr size_t SAMPLES_PER_SYMBOL = SamplesPerSymbol;
     static constexpr double PI = 3.14159265358979323846;
     
-    // Output sample type (interleaved I/Q)
     struct IQSample {
         int16_t I;
         int16_t Q;
     };
-
-private:
-    double phase_ = 0.0;           // Current phase accumulator
-    double amplitude_ = 16383.0;   // Output amplitude (for 16-bit signed: max 32767)
-    int8_t prev_symbol_ = 1;       // Previous symbol for differential encoding (+1 or -1)
     
-    // Precomputed half-sinusoid lookup table for phase progression
-    std::array<double, SamplesPerSymbol> phase_lut_;
-    
-public:
-    MSKModulator(bool use_linear_phase = true)
+    OPVMSKModulator()
+        : phase_(0.0)
+        , prev_symbol_(1)  // Initial state matches HDL
+        , amplitude_(16383.0)  // ~50% of 16-bit range
     {
-        // Precompute phase progression lookup table
-        for (size_t i = 0; i < SamplesPerSymbol; ++i)
-        {
-            double t = static_cast<double>(i) / SamplesPerSymbol;
-            if (use_linear_phase)
-            {
-                // Linear phase ramp = constant frequency (true MSK, matches HDL)
-                // This gives rectangular frequency pulse -> 81.3 kHz null-to-null BW
-                phase_lut_[i] = t;
-            }
-            else
-            {
-                // Half-sinusoid phase = smooth frequency transition (filtered MSK)
-                // This gives raised-cosine frequency pulse
-                phase_lut_[i] = (1.0 - std::cos(PI * t)) / 2.0;
-            }
+        // Pre-compute phase lookup table for linear ramp (true MSK)
+        for (size_t i = 0; i < SamplesPerSymbol; ++i) {
+            double t = static_cast<double>(i + 1) / SamplesPerSymbol;
+            phase_lut_[i] = t;  // Linear phase ramp
         }
     }
     
     /**
-     * Reset the modulator state
+     * Reset modulator state
      */
     void reset()
     {
         phase_ = 0.0;
-        prev_symbol_ = 1;  // Match HDL init state
+        prev_symbol_ = 1;
+    }
+    
+    /**
+     * Get current differential encoder state
+     */
+    int8_t get_prev_symbol() const
+    {
+        return prev_symbol_;
     }
     
     /**
@@ -112,10 +102,10 @@ public:
         
         double start_phase = phase_;
         
-        // Generate samples with smooth phase transition
+        // Generate samples with linear phase transition (true MSK)
         for (size_t i = 0; i < SamplesPerSymbol; ++i)
         {
-            // Instantaneous phase using half-sinusoid shaping
+            // Instantaneous phase using linear ramp
             double inst_phase = start_phase + delta_phase * phase_lut_[i];
             
             // Generate I/Q
@@ -123,118 +113,79 @@ public:
             output[i].Q = static_cast<int16_t>(amplitude_ * std::sin(inst_phase));
         }
         
-        // Update phase for next symbol
-        phase_ = start_phase + delta_phase;
-        
-        // Keep phase bounded to avoid floating point issues
-        while (phase_ > PI) phase_ -= 2.0 * PI;
-        while (phase_ < -PI) phase_ += 2.0 * PI;
+        // Update accumulated phase (wrapped to ±2π for numerical stability)
+        phase_ = std::fmod(start_phase + delta_phase, 2.0 * PI);
     }
     
     /**
-     * Modulate an array of bits
-     * 
-     * @param bits - input bits (unpacked, one bit per byte, LSB used)
-     * @param num_bits - number of bits to process
-     * @return vector of I/Q samples
+     * Generate continuous carrier (single symbol duration, output to array)
      */
-    template <typename InputIt>
-    std::vector<IQSample> modulate(InputIt bits_begin, size_t num_bits)
+    void generate_carrier(std::array<IQSample, SamplesPerSymbol>& output)
     {
-        std::vector<IQSample> output;
-        output.reserve(num_bits * SamplesPerSymbol);
-        
-        std::array<IQSample, SamplesPerSymbol> symbol_samples;
-        
-        auto it = bits_begin;
-        for (size_t i = 0; i < num_bits; ++i, ++it)
+        for (size_t i = 0; i < SamplesPerSymbol; ++i)
         {
-            modulate_bit(*it & 1, symbol_samples);
-            output.insert(output.end(), symbol_samples.begin(), symbol_samples.end());
+            output[i].I = static_cast<int16_t>(amplitude_ * std::cos(phase_));
+            output[i].Q = static_cast<int16_t>(amplitude_ * std::sin(phase_));
         }
-        
-        return output;
     }
     
     /**
-     * Modulate a byte array (packed bits, MSB first)
-     * 
-     * @param bytes - input bytes
-     * @param num_bytes - number of bytes
-     * @return vector of I/Q samples
+     * Generate continuous carrier (arbitrary number of samples)
      */
-    std::vector<IQSample> modulate_bytes(const uint8_t* bytes, size_t num_bytes)
+    std::vector<IQSample> generate_carrier(size_t num_samples)
     {
-        std::vector<IQSample> output;
-        output.reserve(num_bytes * 8 * SamplesPerSymbol);
-        
-        std::array<IQSample, SamplesPerSymbol> symbol_samples;
-        
-        for (size_t i = 0; i < num_bytes; ++i)
+        std::vector<IQSample> samples(num_samples);
+        for (size_t i = 0; i < num_samples; ++i)
         {
-            uint8_t byte = bytes[i];
-            // MSB first
-            for (int bit_idx = 7; bit_idx >= 0; --bit_idx)
-            {
-                uint8_t bit = (byte >> bit_idx) & 1;
-                modulate_bit(bit, symbol_samples);
-                output.insert(output.end(), symbol_samples.begin(), symbol_samples.end());
-            }
+            samples[i].I = static_cast<int16_t>(amplitude_ * std::cos(phase_));
+            samples[i].Q = static_cast<int16_t>(amplitude_ * std::sin(phase_));
         }
-        
-        return output;
+        return samples;
     }
     
     /**
-     * Generate preamble (alternating 1/0 pattern)
-     * 
-     * @param num_bits - number of preamble bits
-     * @return vector of I/Q samples
+     * Generate preamble (alternating 0/1 bits)
      */
     std::vector<IQSample> generate_preamble(size_t num_bits)
     {
-        std::vector<IQSample> output;
-        output.reserve(num_bits * SamplesPerSymbol);
-        
+        std::vector<IQSample> samples;
+        samples.reserve(num_bits * SamplesPerSymbol);
         std::array<IQSample, SamplesPerSymbol> symbol_samples;
         
         for (size_t i = 0; i < num_bits; ++i)
         {
-            modulate_bit(i & 1, symbol_samples);  // Alternating 0, 1, 0, 1...
-            output.insert(output.end(), symbol_samples.begin(), symbol_samples.end());
+            modulate_bit(i & 1, symbol_samples);
+            for (const auto& s : symbol_samples)
+            {
+                samples.push_back(s);
+            }
         }
-        
-        return output;
+        return samples;
     }
     
     /**
-     * Generate unmodulated carrier (for dead carrier periods)
-     * 
-     * @param num_samples - number of I/Q samples to generate
-     * @return vector of I/Q samples at current phase
+     * Modulate a byte (8 bits, MSB first)
      */
-    std::vector<IQSample> generate_carrier(size_t num_samples)
+    void modulate_byte(uint8_t byte, 
+                       std::array<std::array<IQSample, SamplesPerSymbol>, 8>& output)
     {
-        std::vector<IQSample> output(num_samples);
-        
-        // Constant phase = constant I/Q
-        int16_t I = static_cast<int16_t>(amplitude_ * std::cos(phase_));
-        int16_t Q = static_cast<int16_t>(amplitude_ * std::sin(phase_));
-        
-        for (auto& sample : output)
+        for (int i = 7; i >= 0; --i)
         {
-            sample.I = I;
-            sample.Q = Q;
+            modulate_bit((byte >> i) & 1, output[7 - i]);
         }
-        
-        return output;
     }
+
+private:
+    double phase_;              // Current carrier phase
+    int8_t prev_symbol_;        // Previous symbol for differential encoding
+    double amplitude_;          // Output amplitude
+    std::array<double, SamplesPerSymbol> phase_lut_;  // Phase shaping LUT
 };
 
-// 40 samples/bit gives 2.168 MSPS at 54200 bps
-// PlutoSDR minimum is ~521 kSPS, so this is safe
-// Pluto will interpolate up to 61.44 MSPS DAC rate
-// Default uses linear phase (true MSK) to match HDL
-using OPVMSKModulator = MSKModulator<40>;
+// Default modulator type
+using OPVMSKModulator40 = OPVMSKModulator<40>;
 
-} // namespace mobilinkd
+} // namespace opvcxx
+
+// Global namespace alias for backward compatibility with opv-mod.cpp
+using OPVMSKModulator = opvcxx::OPVMSKModulator<40>;
