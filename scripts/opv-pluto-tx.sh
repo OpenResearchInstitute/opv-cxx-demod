@@ -21,14 +21,15 @@ PLUTO_URI="ip:192.168.2.1"          # PlutoSDR address (USB or IP)
 TX_FREQ=435000000                    # TX frequency in Hz (435 MHz)
 SAMPLE_RATE=2168000                  # Must match opv-mod output (2.168 MSPS)
 TX_GAIN=-20                          # TX gain in dB (negative = attenuation)
-BUFFER_SIZE=400000                   # IIO buffer size for smooth streaming
+BUFFER_SIZE=346880                   # IIO buffer size of one frame
+#BUFFER_SIZE=86720                    # one quarter frame, maybe more frequent will work
 CALLSIGN=""                          # Your callsign (required)
 BERT_FRAMES=0                        # Number of BERT frames (0 = voice mode)
 CONTINUOUS=0                         # Continuous transmission mode
 VERBOSE=0                            # Verbose output
 
 # Path to opv-mod (adjust if needed)
-OPV_MOD="./opv-mod"
+OPV_MOD="./opv-mod-hdl-msk"
 
 # =============================================================================
 # USAGE
