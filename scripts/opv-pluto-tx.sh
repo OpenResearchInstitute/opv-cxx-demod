@@ -29,7 +29,10 @@ CONTINUOUS=0                         # Continuous transmission mode
 VERBOSE=0                            # Verbose output
 
 # Path to opv-mod (adjust if needed)
-OPV_MOD="./opv-mod-hdl-msk"
+#OPV_MOD="./opv-mod-hdl-msk"
+#OPV_MOD="./opv-mod-fresh"
+#OPV_MOD="./opv-mod-cpfsk"
+OPV_MOD="./opv-mod-hdl"
 
 # =============================================================================
 # USAGE
