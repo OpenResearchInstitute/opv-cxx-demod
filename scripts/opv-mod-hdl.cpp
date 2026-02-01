@@ -197,10 +197,6 @@ public:
         else if (d_val == -1 && d_val_xor_T == -1) d_val_xor = 1;
         else d_val_xor = 1;  // default when d_val_xor_T = 0
         
-        // HDL TIMING: d_val_xor_T is updated on tclk_dly(0), BEFORE d_s1/d_s2
-        // are computed on tclk_dly(1). So we must update d_val_xor_T first!
-        d_val_xor_T = d_val_xor;
-        
         // Compute d_pos and d_neg (lines 230-231)
         int8_t d_pos = (d_val + 1) >> 1;  // +1→1, -1→0
         int8_t d_neg = (d_val - 1) >> 1;  // +1→0, -1→-1
@@ -209,7 +205,7 @@ public:
         int8_t d_pos_enc = d_pos;
         int8_t d_neg_enc = (b_n == 0) ? d_neg : -d_neg;
         
-        // NOW compute d_s1/d_s2 using the UPDATED d_val_xor_T
+        // Compute d_s1/d_s2 using current d_val_xor_T (updated at end of prev symbol)
         int8_t d_s1, d_s2;
         
         // d_pos_xor (F1 amplitude)
@@ -250,6 +246,9 @@ public:
             while (phase_f2 > PI) phase_f2 -= TWO_PI;
             while (phase_f2 < -PI) phase_f2 += TWO_PI;
         }
+        
+        // Update state for next symbol
+        d_val_xor_T = d_val_xor;
         
         // Toggle b_n for next symbol
         b_n = 1 - b_n;
