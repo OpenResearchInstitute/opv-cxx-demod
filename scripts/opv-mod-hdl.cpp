@@ -10,6 +10,7 @@
  */
 
 #include <iostream>
+#include <iomanip>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -30,6 +31,7 @@ constexpr size_t SAMPLES_PER_SYMBOL = 40;
 constexpr double SAMPLE_RATE = 2168000.0;
 constexpr double SYMBOL_RATE = 54200.0;
 constexpr double FREQ_DEV = SYMBOL_RATE / 4.0;  // 13550 Hz
+bool g_verbose = false;
 constexpr double F1_FREQ = -FREQ_DEV;  // Lower tone
 constexpr double F2_FREQ = +FREQ_DEV;  // Upper tone
 
@@ -77,8 +79,9 @@ public:
     
     void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
         uint8_t state = (in << 6) | sr;
-        g1 = __builtin_parity(state & 0x4F);
-        g2 = __builtin_parity(state & 0x6D);
+        // G1 = 171 octal = 0x79, G2 = 133 octal = 0x5B
+        g1 = __builtin_parity(state & 0x79);
+        g2 = __builtin_parity(state & 0x5B);
         sr = ((sr << 1) | in) & 0x3F;
     }
     
@@ -91,7 +94,7 @@ private:
 // =============================================================================
 
 void interleave(encoded_bits_t& bits) {
-    encoded_bits_t temp;
+    encoded_bits_t temp = {};  // Initialize to zero
     for (size_t i = 0; i < ENCODED_BITS; ++i) {
         temp[(i % 32) * 67 + (i / 32)] = bits[i];
     }
@@ -105,7 +108,7 @@ void interleave(encoded_bits_t& bits) {
 encoded_bits_t encode_frame(const frame_t& payload) {
     LFSR lfsr; lfsr.reset();
     ConvEncoder conv; conv.reset();
-    encoded_bits_t encoded;
+    encoded_bits_t encoded = {};  // Initialize
     size_t out_idx = 0;
     
     std::array<uint8_t, FRAME_BYTES> randomized;
@@ -113,17 +116,54 @@ encoded_bits_t encode_frame(const frame_t& payload) {
         randomized[i] = payload[i] ^ lfsr.next_byte();
     }
     
+    if (g_verbose) {
+        std::cerr << "Randomized[0:5]: ";
+        for (int i = 0; i < 6; ++i) {
+            std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)randomized[i] << " ";
+        }
+        std::cerr << std::dec << "\n";
+    }
+    
     for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
         uint8_t byte = randomized[byte_idx];
+        
+        if (g_verbose && byte_idx == FRAME_BYTES - 1) {
+            std::cerr << "First byte to encode: randomized[" << byte_idx << "] = 0x" 
+                      << std::hex << (int)byte << std::dec << " = ";
+            for (int i = 7; i >= 0; --i) std::cerr << ((byte >> i) & 1);
+            std::cerr << "\n";
+        }
+        
         for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
             uint8_t g1, g2;
-            conv.encode_bit((byte >> bit_pos) & 1, g1, g2);
+            uint8_t in_bit = (byte >> bit_pos) & 1;
+            conv.encode_bit(in_bit, g1, g2);
             encoded[out_idx++] = g1;
             encoded[out_idx++] = g2;
+            
+            // Debug first 8 input bits
+            if (g_verbose && out_idx <= 16) {
+                std::cerr << "  byte[" << byte_idx << "] bit[" << bit_pos << "] = " << (int)in_bit
+                          << " -> G1=" << (int)g1 << " G2=" << (int)g2 
+                          << " (idx " << out_idx-2 << "," << out_idx-1 << ")\n";
+            }
         }
     }
     
+    if (g_verbose) {
+        std::cerr << "Before interleave [0:31]: ";
+        for (int i = 0; i < 32; ++i) std::cerr << (int)encoded[i];
+        std::cerr << "\n";
+    }
+    
     interleave(encoded);
+    
+    if (g_verbose) {
+        std::cerr << "After interleave [0:31]:  ";
+        for (int i = 0; i < 32; ++i) std::cerr << (int)encoded[i];
+        std::cerr << "\n";
+    }
+    
     return encoded;
 }
 
@@ -227,7 +267,6 @@ private:
 // =============================================================================
 
 HDLModulator g_mod;
-bool g_verbose = false;
 bool g_reset_per_frame = false;
 
 // =============================================================================
@@ -255,11 +294,18 @@ void send_sync_word() {
 
 void send_encoded_frame(const encoded_bits_t& encoded) {
     std::array<IQSample, SAMPLES_PER_SYMBOL> samples;
-    for (size_t byte_idx = 0; byte_idx < ENCODED_BITS / 8; ++byte_idx) {
-        for (int bit_in_byte = 7; bit_in_byte >= 0; --bit_in_byte) {
-            g_mod.modulate_bit(encoded[byte_idx * 8 + bit_in_byte], samples);
-            output(samples);
-        }
+    
+    // DEBUG: Print first few encoded bits
+    if (g_verbose) {
+        std::cerr << "Encoded bits [0:9]: ";
+        for (int i = 0; i < 10; ++i) std::cerr << (int)encoded[i];
+        std::cerr << "\n";
+    }
+    
+    // Send bits in linear order
+    for (size_t i = 0; i < ENCODED_BITS; ++i) {
+        g_mod.modulate_bit(encoded[i], samples);
+        output(samples);
     }
 }
 

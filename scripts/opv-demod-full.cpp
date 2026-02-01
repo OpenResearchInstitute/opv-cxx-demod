@@ -1,15 +1,13 @@
 /**
- * opv-demod-full.cpp - Complete OPV software demodulator
+ * opv-demod-full.cpp - OPV demodulator with Viterbi matched to HDL encoder
  * 
- * Tests the full chain: demod -> sync detect -> deinterleave -> Viterbi -> derandomize
+ * Reads int16 IQ samples from stdin, outputs decoded frames to stdout.
  */
-
 #include <iostream>
-#include <fstream>
+#include <vector>
+#include <array>
 #include <cstdint>
 #include <cmath>
-#include <array>
-#include <vector>
 #include <iomanip>
 
 constexpr size_t SAMPLES_PER_SYMBOL = 40;
@@ -19,79 +17,195 @@ constexpr double F1_FREQ = -FREQ_DEV;
 constexpr double F2_FREQ = +FREQ_DEV;
 constexpr double PI = 3.14159265358979323846;
 constexpr double TWO_PI = 2.0 * PI;
-
 constexpr uint32_t SYNC_WORD = 0x02B8DB;
-constexpr size_t SYNC_BITS = 24;
-constexpr size_t PAYLOAD_BITS = 2144;
 constexpr size_t FRAME_BYTES = 134;
+constexpr size_t ENCODED_BITS = 2144;
 
 struct IQSample { int16_t I, Q; };
 
-// =============================================================================
-// DEINTERLEAVER
-// =============================================================================
 void deinterleave(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
-    out.resize(PAYLOAD_BITS);
-    for (size_t i = 0; i < PAYLOAD_BITS; ++i) {
-        size_t row = i / 32;
-        size_t col = i % 32;
+    out.resize(ENCODED_BITS);
+    for (size_t p = 0; p < ENCODED_BITS; ++p) {
+        size_t row = p / 32;
+        size_t col = p % 32;
         size_t src = col * 67 + row;
-        out[i] = (src < in.size()) ? in[src] : 0;
+        out[p] = (src < in.size()) ? in[src] : 0;
     }
 }
 
-// =============================================================================
-// VITERBI DECODER (Simplified - just extracts G1 bits)
-// =============================================================================
-void viterbi_decode(const std::vector<uint8_t>& encoded, std::vector<uint8_t>& decoded) {
-    // 2144 bits -> 1072 pairs -> 1072 decoded bits -> 134 bytes
-    decoded.resize(FRAME_BYTES);
+// Viterbi decoder matched to HDL encoder
+class ViterbiDecoder {
+public:
+    static constexpr int NUM_STATES = 64;
+    static constexpr uint8_t G1 = 0x79;
+    static constexpr uint8_t G2 = 0x5B;
     
-    // Extract bits (G1 at even positions, G2 at odd)
-    std::vector<uint8_t> decoded_bits(1072);
-    for (size_t i = 0; i < 1072; ++i) {
-        // Simple: just use G1 bit (real Viterbi would use both)
-        decoded_bits[i] = encoded[2 * i];
-    }
-    
-    // Pack into bytes, reversing encoder's backward byte order
-    for (size_t byte_idx = 0; byte_idx < FRAME_BYTES; ++byte_idx) {
-        uint8_t byte = 0;
-        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
-            size_t bit_idx = (FRAME_BYTES - 1 - byte_idx) * 8 + (7 - bit_pos);
-            if (bit_idx < 1072) {
-                byte |= (decoded_bits[bit_idx] & 1) << bit_pos;
+    ViterbiDecoder() {
+        for (int sr = 0; sr < NUM_STATES; ++sr) {
+            for (int inp = 0; inp < 2; ++inp) {
+                uint8_t state = (inp << 6) | sr;
+                uint8_t g1 = __builtin_parity(state & G1);
+                uint8_t g2 = __builtin_parity(state & G2);
+                branch_output_[sr][inp] = (g1 << 1) | g2;
+                // MUST match encoder: sr = ((sr << 1) | in) & 0x3F
+                next_state_[sr][inp] = ((sr << 1) | inp) & 0x3F;
             }
         }
-        decoded[byte_idx] = byte;
     }
-}
-
-// =============================================================================
-// LFSR DERANDOMIZER
-// =============================================================================
-void derandomize(std::vector<uint8_t>& data) {
-    uint8_t state = 0xFF;
-    for (size_t i = 0; i < data.size(); ++i) {
-        uint8_t lfsr_byte = 0;
-        for (int j = 7; j >= 0; --j) {
-            lfsr_byte |= ((state >> 7) & 1) << j;
-            uint8_t fb = ((state >> 7) ^ (state >> 6) ^ (state >> 4) ^ (state >> 2)) & 1;
-            state = (state << 1) | fb;
+    
+    std::vector<uint8_t> decode(const std::vector<std::pair<uint8_t, uint8_t>>& symbols) {
+        const size_t n = symbols.size();
+        if (n == 0) return {};
+        
+        constexpr int INF = 100000;
+        std::array<int, NUM_STATES> pm, npm;
+        std::vector<std::array<uint8_t, NUM_STATES>> surv(n);
+        
+        pm.fill(INF);
+        pm[0] = 0;
+        
+        for (size_t t = 0; t < n; ++t) {
+            int rx = (symbols[t].first << 1) | symbols[t].second;
+            npm.fill(INF);
+            
+            for (int s = 0; s < NUM_STATES; ++s) {
+                if (pm[s] >= INF) continue;
+                for (int inp = 0; inp < 2; ++inp) {
+                    int ns = next_state_[s][inp];
+                    int bm = __builtin_popcount(rx ^ branch_output_[s][inp]);
+                    int newpm = pm[s] + bm;
+                    if (newpm < npm[ns]) {
+                        npm[ns] = newpm;
+                        surv[t][ns] = s;
+                    }
+                }
+            }
+            std::swap(pm, npm);
         }
-        data[i] ^= lfsr_byte;
+        
+        int best_s = 0;
+        for (int s = 1; s < NUM_STATES; ++s) {
+            if (pm[s] < pm[best_s]) best_s = s;
+        }
+        
+        std::vector<uint8_t> out(n);
+        int s = best_s;
+        for (int t = n - 1; t >= 0; --t) {
+            int ps = surv[t][s];
+            out[t] = (next_state_[ps][1] == s) ? 1 : 0;
+            s = ps;
+        }
+        return out;
+    }
+    
+private:
+    uint8_t branch_output_[NUM_STATES][2];
+    uint8_t next_state_[NUM_STATES][2];
+};
+
+void derandomize(std::vector<uint8_t>& data) {
+    uint8_t lfsr = 0xFF;
+    for (size_t i = 0; i < data.size(); ++i) {
+        uint8_t rand_byte = 0;
+        for (int b = 7; b >= 0; --b) {
+            rand_byte |= ((lfsr >> 7) & 1) << b;
+            uint8_t fb = ((lfsr >> 7) ^ (lfsr >> 6) ^ (lfsr >> 4) ^ (lfsr >> 2)) & 1;
+            lfsr = (lfsr << 1) | fb;
+        }
+        data[i] ^= rand_byte;
     }
 }
 
-// =============================================================================
-// MAIN
-// =============================================================================
-int main(int argc, char* argv[]) {
-    bool verbose = (argc > 1 && std::string(argv[1]) == "-v");
+std::vector<uint8_t> decode_frame(const std::vector<uint8_t>& payload_bits) {
+    std::vector<uint8_t> deinterleaved;
+    deinterleave(payload_bits, deinterleaved);
+    
+    std::vector<std::pair<uint8_t, uint8_t>> symbols;
+    for (size_t i = 0; i < deinterleaved.size(); i += 2) {
+        symbols.push_back({deinterleaved[i], deinterleaved[i+1]});
+    }
+    
+    ViterbiDecoder vit;
+    auto decoded_bits = vit.decode(symbols);
+    
+    std::vector<uint8_t> decoded_randomized(FRAME_BYTES, 0);
+    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
+        uint8_t byte_val = 0;
+        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
+            size_t bit_idx = (FRAME_BYTES - 1 - byte_idx) * 8 + (7 - bit_pos);
+            if (bit_idx < decoded_bits.size()) {
+                byte_val |= (decoded_bits[bit_idx] & 1) << bit_pos;
+            }
+        }
+        decoded_randomized[byte_idx] = byte_val;
+    }
+    
+    derandomize(decoded_randomized);
+    return decoded_randomized;
+}
+
+void print_frame(int frame_num, const std::vector<uint8_t>& frame) {
+    std::cout << "┌─────────────────────────────────────────────────────────\n";
+    std::cout << "│ FRAME " << frame_num << "\n";
+    std::cout << "├─────────────────────────────────────────────────────────\n";
+    
+    // Callsign (bytes 0-5)
+    std::cout << "│ Callsign: ";
+    bool valid_call = true;
+    for (int i = 0; i < 6; ++i) {
+        if (frame[i] != 0 && (frame[i] < 0x20 || frame[i] > 0x7E)) {
+            valid_call = false;
+            break;
+        }
+    }
+    if (valid_call) {
+        for (int i = 0; i < 6 && frame[i] != 0; ++i) {
+            std::cout << (char)frame[i];
+        }
+        std::cout << "\n";
+    } else {
+        std::cout << "(invalid)\n";
+    }
+    
+    // Frame counter (bytes 6-8)
+    uint32_t frame_counter = (frame[6] << 16) | (frame[7] << 8) | frame[8];
+    std::cout << "│ Counter:  " << frame_counter << "\n";
+    
+    // Hex dump
+    std::cout << "│\n│ Hex dump:\n";
+    for (size_t i = 0; i < frame.size(); i += 16) {
+        std::cout << "│   " << std::hex << std::setfill('0') << std::setw(3) << i << ": ";
+        
+        // Hex
+        for (size_t j = i; j < i + 16 && j < frame.size(); ++j) {
+            std::cout << std::setw(2) << (int)frame[j] << " ";
+        }
+        
+        // Padding if short line
+        for (size_t j = frame.size(); j < i + 16; ++j) {
+            std::cout << "   ";
+        }
+        
+        // ASCII
+        std::cout << " │";
+        for (size_t j = i; j < i + 16 && j < frame.size(); ++j) {
+            char c = (frame[j] >= 0x20 && frame[j] < 0x7F) ? frame[j] : '.';
+            std::cout << c;
+        }
+        std::cout << "│\n";
+    }
+    std::cout << std::dec;
+    
+    std::cout << "└─────────────────────────────────────────────────────────\n\n";
+}
+
+int main() {
+    std::cerr << "OPV Demodulator v1.0\n";
+    std::cerr << "Waiting for IQ data on stdin...\n\n";
     
     double phase_f1 = 0.0, phase_f2 = 0.0;
     double f1_accum = 0.0, f2_accum = 0.0;
-    int sample_count = 0;
+    size_t sample_count = 0;
     int prev_encoded = 0;
     int cclk = 0;
     
@@ -99,13 +213,10 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> payload_bits;
     bool collecting = false;
     
-    int frames_found = 0;
+    size_t total_samples = 0;
+    size_t total_bits = 0;
+    int syncs_found = 0;
     int frames_decoded = 0;
-    long total_samples = 0;
-    long total_bits = 0;
-    
-    std::cerr << "OPV Full Software Demodulator\n";
-    std::cerr << "=============================\n\n";
     
     IQSample s;
     while (std::cin.read(reinterpret_cast<char*>(&s), sizeof(s))) {
@@ -114,11 +225,8 @@ int main(int argc, char* argv[]) {
         double I = s.I / 32768.0;
         double Q = s.Q / 32768.0;
         
-        double sin_f1 = std::sin(phase_f1), cos_f1 = std::cos(phase_f1);
-        double sin_f2 = std::sin(phase_f2), cos_f2 = std::cos(phase_f2);
-        
-        f1_accum += I * sin_f1 + Q * cos_f1;
-        f2_accum += I * sin_f2 + Q * cos_f2;
+        f1_accum += I * std::sin(phase_f1) + Q * std::cos(phase_f1);
+        f2_accum += I * std::sin(phase_f2) + Q * std::cos(phase_f2);
         
         phase_f1 += TWO_PI * F1_FREQ / SAMPLE_RATE;
         phase_f2 += TWO_PI * F2_FREQ / SAMPLE_RATE;
@@ -135,58 +243,40 @@ int main(int argc, char* argv[]) {
             double f2_comp = (cclk == 0) ? -f2_accum : f2_accum;
             double data_sum = f1_accum - f2_comp;
             
-            int encoded = (data_sum < 0) ? 1 : 0;
-            int decoded_bit = encoded ^ prev_encoded;
-            prev_encoded = encoded;
+            int enc = (data_sum < 0) ? 1 : 0;
+            int decoded_bit = enc ^ prev_encoded;
+            prev_encoded = enc;
             
             if (collecting) {
                 payload_bits.push_back(decoded_bit);
                 
-                if (payload_bits.size() == PAYLOAD_BITS) {
-                    collecting = false;
+                if (payload_bits.size() == ENCODED_BITS) {
+                    auto frame = decode_frame(payload_bits);
+                    syncs_found++;
                     
-                    // Deinterleave
-                    std::vector<uint8_t> deinterleaved;
-                    deinterleave(payload_bits, deinterleaved);
-                    
-                    // Viterbi decode
-                    std::vector<uint8_t> decoded;
-                    viterbi_decode(deinterleaved, decoded);
-                    
-                    // Derandomize
-                    derandomize(decoded);
-                    
-                    // Print result
-                    std::cerr << "Frame " << frames_found << ": ";
-                    for (size_t i = 0; i < std::min(size_t(16), decoded.size()); ++i) {
-                        std::cerr << std::hex << std::setw(2) << std::setfill('0') 
-                                  << (int)decoded[i] << " ";
-                    }
-                    std::cerr << "...\n" << std::dec;
-                    
-                    // Check callsign
+                    // Check if valid
                     bool valid = true;
-                    for (int i = 0; i < 5 && decoded[i] != 0; ++i) {
-                        if (decoded[i] < 0x20 || decoded[i] > 0x7F) valid = false;
-                    }
-                    
-                    if (valid && decoded[0] >= 'A' && decoded[0] <= 'Z') {
-                        std::cerr << "  Callsign: ";
-                        for (int i = 0; i < 6 && decoded[i] != 0; ++i) {
-                            std::cerr << (char)decoded[i];
+                    for (int i = 0; i < 6; ++i) {
+                        if (frame[i] != 0 && (frame[i] < 0x20 || frame[i] > 0x7E)) {
+                            valid = false;
+                            break;
                         }
-                        std::cerr << "\n";
-                        frames_decoded++;
                     }
                     
+                    if (valid) {
+                        frames_decoded++;
+                        print_frame(frames_decoded, frame);
+                    } else {
+                        std::cerr << "Frame " << syncs_found << ": decode failed (invalid callsign)\n";
+                    }
+                    
+                    collecting = false;
                     payload_bits.clear();
                 }
             } else {
                 shift_reg = ((shift_reg << 1) | decoded_bit) & 0xFFFFFF;
-                
                 if (shift_reg == SYNC_WORD) {
-                    frames_found++;
-                    std::cerr << "\nSYNC DETECTED at bit " << total_bits << "\n";
+                    std::cerr << "SYNC detected at bit " << total_bits << "\n";
                     collecting = true;
                     payload_bits.clear();
                 }
@@ -199,11 +289,10 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    std::cerr << "\n=============================\n";
-    std::cerr << "Total samples: " << total_samples << "\n";
-    std::cerr << "Total bits: " << total_bits << "\n";
-    std::cerr << "Syncs found: " << frames_found << "\n";
-    std::cerr << "Frames decoded: " << frames_decoded << "\n";
+    std::cerr << "\n────────────────────────────────────────────────────────────\n";
+    std::cerr << "Summary: " << total_samples << " samples, " << total_bits << " bits\n";
+    std::cerr << "         " << syncs_found << " sync(s), " << frames_decoded << " frame(s) decoded\n";
+    std::cerr << "────────────────────────────────────────────────────────────\n";
     
-    return 0;
+    return (frames_decoded > 0) ? 0 : 1;
 }
