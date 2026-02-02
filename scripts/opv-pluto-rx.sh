@@ -1,269 +1,328 @@
-# OPV Software Modem
-
-Software implementation of the Opulent Voice Protocol modulator and demodulator, designed to work with PlutoSDR and match the HDL reference implementation.
-
-## Status
-
-**Software loopback verified working with 0 bit errors.**
-
-```bash
-./opv-mod-hdl -S W5NYV -B 4 | ./opv-demod-full
-# Result: 4 frames decoded, callsign "W5NYV" recovered correctly
-```
-
-## Files
-
-### Core Components
-
-| File | Description |
-|------|-------------|
-| `opv-mod-hdl.cpp` | Transmitter - HDL-accurate parallel-tone MSK modulator |
-| `opv-demod-full.cpp` | Receiver - Full demodulator with Viterbi decoder |
-| `opv-pluto-tx.sh` | PlutoSDR transmit script |
-| `opv-pluto-rx.sh` | PlutoSDR receive script |
-| `Makefile` | Build system |
-
-### Legacy/Alternative Files
-
-These files exist from earlier development and may be useful for comparison or debugging:
-
-| File | Notes |
-|------|-------|
-| `opv-mod-fresh.cpp` | Earlier modulator version |
-| `opv-mod-cpfsk.cpp` | Simple CPFSK modulator (single NCO) |
-
-## Build
-
-```bash
-make
-```
-
-Or build individually:
-
-```bash
-g++ -std=c++17 -O2 -o opv-mod-hdl opv-mod-hdl.cpp -lm
-g++ -std=c++17 -O2 -o opv-demod-full opv-demod-full.cpp -lm
-```
-
-## Usage
-
-### Software Loopback Test
-
-```bash
-./opv-mod-hdl -S W5NYV -B 4 | ./opv-demod-full
-```
-
-### PlutoSDR Transmit
-
-```bash
-# Send 10 BERT frames at 435 MHz
-./opv-pluto-tx.sh -S W5NYV -B 10
-
-# Continuous transmission
-./opv-pluto-tx.sh -S W5NYV -B 10 -c
-
-# Different frequency
-./opv-pluto-tx.sh -S W5NYV -B 5 -f 144390000
-```
-
-### PlutoSDR Receive
-
-```bash
-# Receive for 10 seconds at 435 MHz
-./opv-pluto-rx.sh -t 10
-
-# Continuous receive (Ctrl+C to stop)
-./opv-pluto-rx.sh
-
-# Save raw IQ for debugging
-./opv-pluto-rx.sh -t 10 -o capture.iq
-
-# Different frequency and gain
-./opv-pluto-rx.sh -f 144390000 -g 50
-```
-
-## Signal Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| Sample Rate | 2.168 MSPS |
-| Symbol Rate | 54.2 kbaud |
-| Modulation | MSK (parallel-tone) |
-| Frequency Deviation | ±13.55 kHz |
-| Samples per Symbol | 40 |
-| IQ Format | int16 I, int16 Q (4 bytes/sample) |
-
-## Frame Format
-
-| Field | Bytes | Description |
-|-------|-------|-------------|
-| Sync Word | 3 (24 bits) | 0x02B8DB |
-| Payload | 134 | Encoded + interleaved data |
-
-### Payload Structure (before encoding)
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0-5 | 6 | Callsign (ASCII, null-padded) |
-| 6-8 | 3 | Frame counter (24-bit big-endian) |
-| 9-11 | 3 | Reserved |
-| 12-133 | 122 | Data (BERT pattern in test mode) |
-
-## Signal Processing Chain
-
-### Transmit (opv-mod-hdl)
-
-```
-Payload (134 bytes)
-    │
-    ▼
-LFSR Randomizer (seed 0xFF, poly x^8+x^7+x^5+x^3+1)
-    │
-    ▼
-Convolutional Encoder (K=7, r=1/2, G1=0x79, G2=0x5B)
-    │
-    ▼
-Bit Interleaver (67×32 matrix)
-    │
-    ▼
-MSK Modulator (parallel-tone, ±13.55 kHz)
-    │
-    ▼
-IQ Samples (int16)
-```
-
-### Receive (opv-demod-full)
-
-```
-IQ Samples (int16)
-    │
-    ▼
-MSK Demodulator (dual correlators + CCLK compensation)
-    │
-    ▼
-Differential Decoder
-    │
-    ▼
-Sync Word Detection (0x02B8DB)
-    │
-    ▼
-Bit Deinterleaver (67×32 matrix)
-    │
-    ▼
-Viterbi Decoder (K=7, r=1/2)
-    │
-    ▼
-LFSR Derandomizer
-    │
-    ▼
-Payload (134 bytes)
-```
-
-## Technical Notes
-
-### Viterbi Decoder
-
-The Viterbi decoder state transitions must match the encoder exactly:
-
-```cpp
-// Encoder state update:
-sr = ((sr << 1) | input_bit) & 0x3F;
-
-// Decoder must use same transition:
-next_state[sr][inp] = ((sr << 1) | inp) & 0x3F;
-```
-
-The decoder uses "best ending state" traceback (not state 0) since the protocol does not include tail bits.
-
-### Byte/Bit Ordering
-
-- Bytes are processed in reverse order (byte 133 first, byte 0 last)
-- Bits within each byte are MSB first (bit 7 first, bit 0 last)
-- Encoded bits are transmitted in linear order after interleaving
-
-### Buffer Sizes
-
-One frame = 2168 bits × 40 samples/bit × 4 bytes/sample = **346,880 bytes**
-
-This is used as the IIO buffer size in both TX and RX scripts.
-
-## Demodulator Output
-
-The demodulator outputs decoded frames to stdout with formatted display:
-
-```
-┌─────────────────────────────────────────────────────────
-│ FRAME 1
-├─────────────────────────────────────────────────────────
-│ Callsign: W5NYV
-│ Counter:  0
-│
-│ Hex dump:
-│   000: 57 35 4e 59 56 00 00 00 00 00 00 00 00 01 02 03  │W5NYV...........│
-│   010: 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13  │................│
-│   ...
-└─────────────────────────────────────────────────────────
-```
-
-Status messages go to stderr, allowing redirection:
-
-```bash
-./opv-pluto-rx.sh -t 10 > frames.txt 2>status.txt
-```
-
-## Hardware Testing
-
-### Prerequisites
-
-- PlutoSDR with libiio tools installed
-- Two PlutoSDRs for over-the-air testing, or cabled loopback with attenuation
-
-### Test Procedure
-
-1. **Build the tools:**
-   ```bash
-   make
-   ```
-
-2. **Verify software loopback:**
-   ```bash
-   ./opv-mod-hdl -S YOURCALL -B 4 | ./opv-demod-full
-   ```
-
-3. **Test PlutoSDR TX (terminal 1):**
-   ```bash
-   ./opv-pluto-tx.sh -S YOURCALL -B 10 -f 435000000
-   ```
-
-4. **Test PlutoSDR RX (terminal 2, different Pluto or cabled):**
-   ```bash
-   ./opv-pluto-rx.sh -t 15 -f 435000000 -o capture.iq
-   ```
-
-5. **If decode fails, analyze saved IQ:**
-   ```bash
-   ./opv-demod-full < capture.iq
-   ```
-
-## Troubleshooting
-
-### No sync detected
-- Check frequency match between TX and RX
-- Verify signal level (adjust TX/RX gain)
-- Confirm sample rate is exactly 2.168 MSPS
-
-### Sync found but decode fails
-- Save IQ with `-o capture.iq` and analyze offline
-- Check for frequency offset (demod has no AFC)
-- Verify frame counter is incrementing (rules out stuck TX)
-
-### PlutoSDR connection issues
-```bash
-# Check connection
-iio_info -u ip:192.168.2.1
-
-# Try USB instead of network
-iio_info -u usb:
-```
-
-
+#!/bin/bash
+#
+# opv-pluto-rx.sh - Receive and decode OPV frames via PlutoSDR
+#
+# Copyright 2026 Open Research Institute, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Usage:
+#   ./opv-pluto-rx.sh                          # Receive until Ctrl+C
+#   ./opv-pluto-rx.sh -t 10                    # Receive for 10 seconds
+#   ./opv-pluto-rx.sh -n 21680000              # Receive 21.68M samples (10 sec)
+#   ./opv-pluto-rx.sh -o capture.iq            # Save raw IQ for debugging
+#   ./opv-pluto-rx.sh -f 144390000 -g 40       # 144.39 MHz, 40dB gain
+#
+
+set -e
+
+# =============================================================================
+# DEFAULT CONFIGURATION
+# =============================================================================
+
+PLUTO_URI="ip:192.168.2.1"          # PlutoSDR address (USB or IP)
+RX_FREQ=435000000                    # RX frequency in Hz (435 MHz)
+SAMPLE_RATE=2168000                  # Must match OPV spec (2.168 MSPS)
+RX_GAIN=40                           # RX gain in dB (RF front-end only)
+BUFFER_SIZE=346880                   # One frame: 2168 bits * 40 samp/bit * 4 bytes/samp
+DURATION=0                           # Capture duration in seconds (0 = continuous)
+NUM_SAMPLES=0                        # Number of samples (0 = use duration or continuous)
+IQ_FILE=""                           # Save raw IQ to file (empty = don't save)
+VERBOSE=0                            # Verbose output
+
+# Path to opv-demod (adjust if needed)
+OPV_DEMOD="./opv-demod-full"
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage() {
+    cat << USAGE_EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Receive and decode OPV frames via PlutoSDR.
+
+Options:
+  -f, --frequency HZ     RX frequency in Hz (default: $RX_FREQ)
+  -g, --gain DB          RX gain in dB (default: $RX_GAIN)
+  -t, --time SECONDS     Capture duration in seconds (default: continuous)
+  -n, --samples COUNT    Number of samples to capture (overrides -t)
+  -o, --output FILE      Save raw IQ samples to file (for debugging)
+  -u, --uri URI          PlutoSDR URI (default: $PLUTO_URI)
+  -v, --verbose          Verbose output
+  -h, --help             Show this help
+
+Examples:
+  $(basename "$0")                             # Receive at 435 MHz until Ctrl+C
+  $(basename "$0") -t 10                       # Receive for 10 seconds
+  $(basename "$0") -t 30 -o capture.iq         # 30 sec capture, save IQ
+  $(basename "$0") -f 144390000 -g 50          # 144.39 MHz with 50dB gain
+
+Decoded frames are written to stdout. Status messages go to stderr.
+To save decoded output:
+  $(basename "$0") -t 10 > frames.txt 2>status.txt
+
+USAGE_EOF
+    exit 1
+}
+
+# =============================================================================
+# PARSE ARGUMENTS
+# =============================================================================
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--frequency)
+            RX_FREQ="$2"
+            shift 2
+            ;;
+        -g|--gain)
+            RX_GAIN="$2"
+            shift 2
+            ;;
+        -t|--time)
+            DURATION="$2"
+            shift 2
+            ;;
+        -n|--samples)
+            NUM_SAMPLES="$2"
+            shift 2
+            ;;
+        -o|--output)
+            IQ_FILE="$2"
+            shift 2
+            ;;
+        -u|--uri)
+            PLUTO_URI="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+# Find the demodulator binary
+if [[ ! -x "$OPV_DEMOD" ]]; then
+    if [[ -x "./opv-demod-full" ]]; then
+        OPV_DEMOD="./opv-demod-full"
+    elif [[ -x "./opv-demod-fixed" ]]; then
+        OPV_DEMOD="./opv-demod-fixed"
+    elif [[ -x "./apps/opv-demod-full" ]]; then
+        OPV_DEMOD="./apps/opv-demod-full"
+    elif [[ -x "./apps/opv-demod" ]]; then
+        OPV_DEMOD="./apps/opv-demod"
+    else
+        echo "Error: Cannot find opv-demod-full executable" >&2
+        echo "Make sure you have built it and are in the right directory" >&2
+        echo "Build with: g++ -std=c++17 -O2 -o opv-demod-full opv-demod-full.cpp -lm" >&2
+        exit 1
+    fi
+fi
+
+# Check for iio_attr
+if ! command -v iio_attr &> /dev/null; then
+    echo "Error: iio_attr not found. Install libiio:" >&2
+    echo "  macOS:  brew install libiio" >&2
+    echo "  Ubuntu: sudo apt install libiio-utils" >&2
+    exit 1
+fi
+
+# Check for iio tools - newer libiio uses iio_rwdev, older uses iio_readdev
+if command -v iio_rwdev &> /dev/null; then
+    IIO_READ_CMD="iio_rwdev"
+    IIO_READ_OPTS=""
+elif command -v iio_readdev &> /dev/null; then
+    IIO_READ_CMD="iio_readdev"
+    IIO_READ_OPTS=""
+else
+    echo "Error: Neither iio_rwdev nor iio_readdev found. Install libiio:" >&2
+    echo "  macOS:  Build from source (https://github.com/analogdevicesinc/libiio)" >&2
+    echo "  Ubuntu: sudo apt install libiio-utils" >&2
+    exit 1
+fi
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+log() {
+    if [[ $VERBOSE -eq 1 ]]; then
+        echo "[INFO] $*" >&2
+    fi
+}
+
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+format_freq() {
+    local freq=$1
+    if [[ $freq -ge 1000000000 ]]; then
+        printf "%.3f GHz" "$(echo "scale=3; $freq/1000000000" | bc)"
+    elif [[ $freq -ge 1000000 ]]; then
+        printf "%.3f MHz" "$(echo "scale=3; $freq/1000000" | bc)"
+    elif [[ $freq -ge 1000 ]]; then
+        printf "%.3f kHz" "$(echo "scale=3; $freq/1000" | bc)"
+    else
+        printf "%d Hz" "$freq"
+    fi
+}
+
+format_samples() {
+    local samples=$1
+    if [[ $samples -ge 1000000000 ]]; then
+        printf "%.2fG" "$(echo "scale=2; $samples/1000000000" | bc)"
+    elif [[ $samples -ge 1000000 ]]; then
+        printf "%.2fM" "$(echo "scale=2; $samples/1000000" | bc)"
+    elif [[ $samples -ge 1000 ]]; then
+        printf "%.2fk" "$(echo "scale=2; $samples/1000" | bc)"
+    else
+        printf "%d" "$samples"
+    fi
+}
+
+cleanup() {
+    echo "" >&2
+    echo "Interrupted. Cleaning up..." >&2
+    jobs -p | xargs -r kill 2>/dev/null || true
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+# =============================================================================
+# CHECK PLUTO CONNECTION
+# =============================================================================
+
+echo "==============================================" >&2
+echo "OPV PlutoSDR Receiver" >&2
+echo "==============================================" >&2
+echo "" >&2
+echo "Checking PlutoSDR connection at $PLUTO_URI..." >&2
+
+if ! iio_info -u "$PLUTO_URI" &> /dev/null; then
+    error "Cannot connect to PlutoSDR at $PLUTO_URI"
+    echo "" >&2
+    echo "Troubleshooting:" >&2
+    echo "  1. Check USB connection" >&2
+    echo "  2. Try: iio_info -u usb:" >&2
+    echo "  3. Try: iio_info -u ip:192.168.2.1" >&2
+    echo "  4. Check if PlutoSDR is powered on" >&2
+    exit 1
+fi
+
+echo "PlutoSDR connected" >&2
+
+# =============================================================================
+# CONFIGURE PLUTO
+# =============================================================================
+
+echo "" >&2
+echo "Configuring PlutoSDR..." >&2
+
+# Set RX LO frequency (altvoltage0 is RX_LO, altvoltage1 is TX_LO)
+log "Setting RX frequency to $(format_freq $RX_FREQ)"
+iio_attr -u "$PLUTO_URI" -c ad9361-phy altvoltage0 frequency "$RX_FREQ" > /dev/null
+echo "  RX Frequency: $(format_freq $RX_FREQ)" >&2
+
+# Set sample rate on ad9361-phy (input channel for RX)
+log "Setting sample rate to $SAMPLE_RATE SPS"
+iio_attr -u "$PLUTO_URI" -c ad9361-phy -i voltage0 sampling_frequency "$SAMPLE_RATE" > /dev/null
+echo "  Sample Rate:  $SAMPLE_RATE SPS (2.168 MSPS)" >&2
+
+# Set RF bandwidth
+log "Setting RF bandwidth to $SAMPLE_RATE Hz"
+iio_attr -u "$PLUTO_URI" -c ad9361-phy -i voltage0 rf_bandwidth "$SAMPLE_RATE" > /dev/null 2>&1 || true
+echo "  RF Bandwidth: $SAMPLE_RATE Hz" >&2
+
+# Set RX hardware gain
+log "Setting RX gain to $RX_GAIN dB"
+iio_attr -u "$PLUTO_URI" -c ad9361-phy -i voltage0 hardwaregain "$RX_GAIN" > /dev/null 2>&1 || true
+echo "  RX Gain:      $RX_GAIN dB" >&2
+
+echo "" >&2
+echo "PlutoSDR configured" >&2
+
+# =============================================================================
+# BUILD COMMAND
+# =============================================================================
+
+# Calculate number of samples if duration specified
+if [[ $NUM_SAMPLES -eq 0 && $DURATION -gt 0 ]]; then
+    NUM_SAMPLES=$((DURATION * SAMPLE_RATE))
+fi
+
+# Build iio read command
+IIO_CMD="$IIO_READ_CMD -u $PLUTO_URI -b $BUFFER_SIZE"
+
+if [[ $NUM_SAMPLES -gt 0 ]]; then
+    IIO_CMD="$IIO_CMD -s $NUM_SAMPLES"
+    MODE="Timed capture: $(format_samples $NUM_SAMPLES) samples"
+    if [[ $DURATION -gt 0 ]]; then
+        MODE="$MODE (~${DURATION}s)"
+    fi
+else
+    MODE="Continuous (Ctrl+C to stop)"
+fi
+
+IIO_CMD="$IIO_CMD $IIO_READ_OPTS cf-ad9361-lpc"
+
+# =============================================================================
+# RECEIVE
+# =============================================================================
+
+echo "" >&2
+echo "==============================================" >&2
+echo "Receiving..." >&2
+echo "==============================================" >&2
+echo "  Mode:       $MODE" >&2
+echo "  Frequency:  $(format_freq $RX_FREQ)" >&2
+echo "  Gain:       $RX_GAIN dB" >&2
+echo "  Demod:      $OPV_DEMOD" >&2
+if [[ -n "$IQ_FILE" ]]; then
+    echo "  IQ Output:  $IQ_FILE" >&2
+fi
+echo "" >&2
+echo "Command: $IIO_CMD | $OPV_DEMOD" >&2
+echo "" >&2
+
+if [[ $NUM_SAMPLES -gt 0 ]]; then
+    echo "Receiving $(format_samples $NUM_SAMPLES) samples..." >&2
+else
+    echo "Receiving (Ctrl+C to stop)..." >&2
+fi
+echo "" >&2
+
+# Run the pipeline
+if [[ -n "$IQ_FILE" ]]; then
+    # Save IQ and decode (tee to file)
+    $IIO_CMD | tee "$IQ_FILE" | "$OPV_DEMOD"
+    echo "" >&2
+    echo "Raw IQ saved to: $IQ_FILE" >&2
+    # Get file size (works on both Linux and macOS)
+    if [[ -f "$IQ_FILE" ]]; then
+        FILESIZE=$(wc -c < "$IQ_FILE" | tr -d ' ')
+        FILESAMPLES=$((FILESIZE / 4))
+        echo "  Size: $FILESIZE bytes" >&2
+        echo "  Samples: $FILESAMPLES" >&2
+    fi
+else
+    # Direct decode
+    $IIO_CMD | "$OPV_DEMOD"
+fi
+
+echo "" >&2
+echo "Reception complete" >&2
