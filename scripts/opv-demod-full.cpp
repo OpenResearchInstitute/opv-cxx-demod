@@ -167,9 +167,9 @@ void print_frame(int frame_num, const std::vector<uint8_t>& frame) {
         std::cout << "(invalid)\n";
     }
     
-    // Frame counter (bytes 6-8)
-    uint32_t frame_counter = (frame[6] << 16) | (frame[7] << 8) | frame[8];
-    std::cout << "│ Counter:  " << frame_counter << "\n";
+    // AAAAA Token (bytes 6-8)
+    uint32_t aaaaa_token = (frame[6] << 16) | (frame[7] << 8) | frame[8];
+    std::cout << "|    Token: " <<aaaaa_token<< "\n";
     
     // Hex dump
     std::cout << "│\n│ Hex dump:\n";
