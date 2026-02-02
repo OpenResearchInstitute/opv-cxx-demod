@@ -269,61 +269,84 @@ private:
 };
 
 //------------------------------------------------------------------------------
-// Sync State Machine with Soft Correlation
+// Sync State Machine with Circular Buffer (like HDL)
+//------------------------------------------------------------------------------
+// Key insight from HDL: Use a FIXED-SIZE circular buffer with wrap-around.
+// This eliminates index shifting and buffer trimming issues.
+//
+// Architecture:
+// 1. Large circular buffer holds ~2 frames of soft symbols
+// 2. Write pointer advances and wraps around
+// 3. When sync found, we record payload position RELATIVE to write pointer
+// 4. Frame extraction uses circular indexing into the buffer
+// 5. Multiple frames can be "in flight" without index corruption
 //------------------------------------------------------------------------------
 class SyncTracker {
 public:
+    static constexpr size_t CIRC_BUF_SIZE = FRAME_SYMBOLS * 3;  // 3 frames worth
+    
     SyncTracker() : state_(SyncState::HUNTING),
                     symbols_since_sync_(0), consecutive_misses_(0),
-                    total_frames_(0), corr_buf_idx_(0) {
+                    total_frames_(0), corr_buf_idx_(0),
+                    circ_write_idx_(0), total_symbols_(0) {
         // Precompute sync word correlation pattern
         // For each bit: '1' expects negative soft (F1), '0' expects positive (F2)
         for (int i = 0; i < (int)SYNC_BITS; ++i) {
             int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
             sync_pattern_[i] = (bit == 1) ? -1.0 : +1.0;
         }
-        // Initialize soft correlation buffer
+        // Initialize buffers
         soft_corr_buf_.fill(0.0);
+        circ_buf_.fill(0.0);
+        
+        // Clear pending frame
+        pending_frame_.reserve(ENCODED_BITS);
     }
     
     struct Result {
         bool frame_ready;
-        size_t payload_start;
         double sync_quality;  // Normalized correlation value (-1 to +1)
+        std::vector<double> payload;  // The actual payload data (copied out)
     };
     
     Result process(double soft_val, size_t sym_idx) {
-        Result res = {false, 0, 0.0};
+        Result res = {false, 0.0, {}};
         
-        // Update circular buffer for soft correlation
+        // Update circular buffer for soft correlation (sync detection)
         soft_corr_buf_[corr_buf_idx_] = soft_val;
         corr_buf_idx_ = (corr_buf_idx_ + 1) % SYNC_BITS;
         
-        // Buffer soft values for payload extraction
-        soft_buf_.push_back(soft_val);
+        // Update main circular buffer (for payload extraction)
+        circ_buf_[circ_write_idx_] = soft_val;
+        circ_write_idx_ = (circ_write_idx_ + 1) % CIRC_BUF_SIZE;
+        total_symbols_++;
+        
+        // If collecting payload, add to pending frame
+        if (collecting_payload_) {
+            pending_frame_.push_back(soft_val);
+        }
         
         symbols_since_sync_++;
         
         switch (state_) {
         case SyncState::HUNTING: {
             // Need at least 24 symbols before checking for sync
-            if (soft_buf_.size() < SYNC_BITS) break;
+            if (total_symbols_ < SYNC_BITS) break;
             
             double raw_corr;
             double norm_corr = soft_correlate(&raw_corr);
-            // In HUNTING mode, require BOTH high raw correlation (strong signal)
-            // AND high normalized correlation (good pattern match)
+            
             if (raw_corr >= RAW_SYNC_HUNTING_THRESHOLD && norm_corr >= SOFT_SYNC_HUNTING_THRESHOLD) {
                 state_ = SyncState::VERIFYING;
-                payload_start_ = soft_buf_.size();
                 sync_quality_ = norm_corr;
                 symbols_since_sync_ = 0;
-                fprintf(stderr, "[%zu] HUNTING→VERIFYING (corr=%.3f, raw=%.0f)\n", sym_idx, norm_corr, raw_corr);
-            }
-            // Limit buffer in hunting mode
-            if (soft_buf_.size() > 50000) {
-                soft_buf_.erase(soft_buf_.begin(), soft_buf_.begin() + 40000);
-                payload_start_ = 0;
+                
+                // Start collecting payload for this frame
+                collecting_payload_ = true;
+                pending_frame_.clear();
+                
+                fprintf(stderr, "[%zu] HUNTING→VERIFYING (corr=%.3f, raw=%.0f)\n", 
+                        sym_idx, norm_corr, raw_corr);
             }
             break;
         }
@@ -332,14 +355,21 @@ public:
             if (symbols_since_sync_ >= ENCODED_BITS) {
                 // Frame complete - output it
                 res.frame_ready = true;
-                res.payload_start = payload_start_;
                 res.sync_quality = sync_quality_;
+                res.payload = std::move(pending_frame_);
                 total_frames_++;
+                
+                // Prepare for next frame
+                pending_frame_.clear();
+                pending_frame_.reserve(ENCODED_BITS);
+                collecting_payload_ = false;  // Will start after next sync
                 
                 // Transition to LOCKED
                 state_ = SyncState::LOCKED;
-                symbols_since_sync_ = 0;
                 consecutive_misses_ = 0;
+                
+                // symbols_since_sync_ stays at ENCODED_BITS
+                // Next sync expected in SYNC_BITS more symbols
                 
                 fprintf(stderr, "[%zu] VERIFYING→LOCKED (frame %d)\n", sym_idx, total_frames_);
             }
@@ -352,13 +382,13 @@ public:
                 double raw_corr;
                 double corr = soft_correlate(&raw_corr);
                 
-                // The payload we just received starts ENCODED_BITS symbols ago
-                size_t received_payload_start = soft_buf_.size() - ENCODED_BITS;
-                
                 if (corr >= SOFT_SYNC_LOCKED_THRESHOLD) {
-                    // Good sync
+                    // Good sync - start collecting next payload
                     consecutive_misses_ = 0;
                     sync_quality_ = corr;
+                    collecting_payload_ = true;
+                    pending_frame_.clear();
+                    
                     fprintf(stderr, "[%zu] LOCKED: sync OK (corr=%.3f)\n", sym_idx, corr);
                 } else {
                     // Missed sync
@@ -368,28 +398,32 @@ public:
                     
                     if (consecutive_misses_ >= SYNC_MISS_LIMIT) {
                         state_ = SyncState::HUNTING;
+                        collecting_payload_ = false;
                         fprintf(stderr, "[%zu] LOCKED→HUNTING (lost lock)\n", sym_idx);
                         break;
                     }
                     
-                    // Flywheel: continue anyway
+                    // Flywheel: collect payload anyway assuming sync was there
                     sync_quality_ = corr;
+                    collecting_payload_ = true;
+                    pending_frame_.clear();
                 }
                 
-                // Output the frame we just received
+                // Reset counter for next frame
+                symbols_since_sync_ = 0;
+            }
+            
+            // Output frame when payload is complete
+            if (collecting_payload_ && pending_frame_.size() >= ENCODED_BITS) {
                 res.frame_ready = true;
-                res.payload_start = received_payload_start;
                 res.sync_quality = sync_quality_;
+                res.payload = std::move(pending_frame_);
                 total_frames_++;
                 
-                symbols_since_sync_ = 0;
-                
-                // Trim buffer (keep enough for next frame)
-                if (soft_buf_.size() > FRAME_SYMBOLS * 4) {
-                    size_t keep = FRAME_SYMBOLS * 2;
-                    size_t trim = soft_buf_.size() - keep;
-                    soft_buf_.erase(soft_buf_.begin(), soft_buf_.begin() + trim);
-                }
+                // Prepare for next frame (will start collecting after sync)
+                pending_frame_.clear();
+                pending_frame_.reserve(ENCODED_BITS);
+                collecting_payload_ = false;
             }
             break;
         }
@@ -400,60 +434,53 @@ public:
     
     SyncState get_state() const { return state_; }
     int get_total_frames() const { return total_frames_; }
-    
-    const double* get_payload(size_t start) const {
-        if (start + ENCODED_BITS <= soft_buf_.size()) {
-            return &soft_buf_[start];
-        }
-        return nullptr;
-    }
 
 private:
     // Soft correlation: returns normalized correlation (-1 to +1)
-    // +1 = perfect match, 0 = random, -1 = inverted
-    // Also outputs raw (unnormalized) correlation for energy check
     double soft_correlate(double* raw_corr = nullptr) {
         double sum = 0.0;
         double energy = 0.0;
         
         for (size_t i = 0; i < SYNC_BITS; ++i) {
-            // Get soft value from circular buffer (oldest to newest)
             size_t buf_idx = (corr_buf_idx_ + i) % SYNC_BITS;
             double soft = soft_corr_buf_[buf_idx];
-            
-            // Multiply by expected sign and accumulate
             sum += soft * sync_pattern_[i];
             energy += std::abs(soft);
         }
         
         if (raw_corr) *raw_corr = sum;
-        
-        // Normalize by total energy to get -1 to +1 range
-        if (energy < MIN_SYNC_ENERGY) return 0.0;  // Not enough signal
+        if (energy < MIN_SYNC_ENERGY) return 0.0;
         return sum / energy;
     }
     
     SyncState state_;
-    std::vector<double> soft_buf_;
     
-    // Circular buffer for soft correlation (last 24 soft values)
+    // Circular buffer for sync correlation (last 24 symbols)
     std::array<double, SYNC_BITS> soft_corr_buf_;
     size_t corr_buf_idx_;
     
-    // Precomputed sync pattern: +1 for expected '0', -1 for expected '1'
+    // Main circular buffer for all symbols
+    std::array<double, CIRC_BUF_SIZE> circ_buf_;
+    size_t circ_write_idx_;
+    size_t total_symbols_;
+    
+    // Precomputed sync pattern
     std::array<double, SYNC_BITS> sync_pattern_;
     
+    // Frame collection state
+    bool collecting_payload_ = false;
+    std::vector<double> pending_frame_;  // Collects payload symbols directly
+    
     size_t symbols_since_sync_;
-    size_t payload_start_;
     double sync_quality_;
     int consecutive_misses_;
     int total_frames_;
     
-    // Soft correlation thresholds
-    static constexpr double SOFT_SYNC_HUNTING_THRESHOLD = 0.85;  // Normalized: need strong pattern match
-    static constexpr double SOFT_SYNC_LOCKED_THRESHOLD = 0.40;   // Normalized: relaxed for flywheel
-    static constexpr double RAW_SYNC_HUNTING_THRESHOLD = 5000.0; // Raw: need strong signal (~200/symbol avg)
-    static constexpr double MIN_SYNC_ENERGY = 100.0;             // Minimum energy (avoid div by zero)
+    // Thresholds
+    static constexpr double SOFT_SYNC_HUNTING_THRESHOLD = 0.85;
+    static constexpr double SOFT_SYNC_LOCKED_THRESHOLD = 0.40;
+    static constexpr double RAW_SYNC_HUNTING_THRESHOLD = 5000.0;
+    static constexpr double MIN_SYNC_ENERGY = 100.0;
 };
 
 //------------------------------------------------------------------------------
@@ -670,22 +697,19 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < soft.size(); ++i) {
         auto res = tracker.process(soft[i], i);
         
-        if (res.frame_ready) {
-            const double* payload = tracker.get_payload(res.payload_start);
-            if (payload) {
-                std::array<uint8_t, FRAME_BYTES> frame;
-                int metric = fdec.decode(payload, frame);
+        if (res.frame_ready && !res.payload.empty()) {
+            std::array<uint8_t, FRAME_BYTES> frame;
+            int metric = fdec.decode(res.payload.data(), frame);
+            
+            if (metric >= 0) {
+                decoded++;
+                if (metric == 0) perfect++;
                 
-                if (metric >= 0) {
-                    decoded++;
-                    if (metric == 0) perfect++;
-                    
-                    if (!quiet)
-                        print_frame(decoded, frame, metric, res.sync_quality);
-                    
-                    if (raw)
-                        std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
-                }
+                if (!quiet)
+                    print_frame(decoded, frame, metric, res.sync_quality);
+                
+                if (raw)
+                    std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
             }
         }
     }
