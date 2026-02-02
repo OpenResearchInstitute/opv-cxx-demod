@@ -30,7 +30,12 @@ IQ_FILE=""                           # Save raw IQ to file (empty = don't save)
 VERBOSE=0                            # Verbose output
 
 # Path to opv-demod (adjust if needed)
-OPV_DEMOD="./opv-demod-full"
+# NOTE: opv-demod-afc is the fixed version with:
+#   - Correct Viterbi polynomial masks (0x4F, 0x6D)
+#   - AFC (automatic frequency control)
+#   - Proper state machine (HUNTING/LOCKED)
+#   - Base-40 callsign decoding
+OPV_DEMOD="./opv-demod-afc"
 
 # =============================================================================
 # USAGE
@@ -116,18 +121,20 @@ done
 
 # Find the demodulator binary
 if [[ ! -x "$OPV_DEMOD" ]]; then
-    if [[ -x "./opv-demod-full" ]]; then
+    if [[ -x "./opv-demod-afc" ]]; then
+        OPV_DEMOD="./opv-demod-afc"
+    elif [[ -x "./opv-demod-full" ]]; then
         OPV_DEMOD="./opv-demod-full"
     elif [[ -x "./opv-demod-fixed" ]]; then
         OPV_DEMOD="./opv-demod-fixed"
-    elif [[ -x "./apps/opv-demod-full" ]]; then
-        OPV_DEMOD="./apps/opv-demod-full"
+    elif [[ -x "./apps/opv-demod-afc" ]]; then
+        OPV_DEMOD="./apps/opv-demod-afc"
     elif [[ -x "./apps/opv-demod" ]]; then
         OPV_DEMOD="./apps/opv-demod"
     else
-        echo "Error: Cannot find opv-demod-full executable" >&2
+        echo "Error: Cannot find opv-demod-afc executable" >&2
         echo "Make sure you have built it and are in the right directory" >&2
-        echo "Build with: g++ -std=c++17 -O2 -o opv-demod-full opv-demod-full.cpp -lm" >&2
+        echo "Build with: g++ -std=c++17 -O2 -o opv-demod-afc opv-demod-afc.cpp" >&2
         exit 1
     fi
 fi

@@ -1,12 +1,13 @@
 /**
- * opv-mod-hdl.cpp - OPV transmitter matching HDL modulator exactly
+ * opv-mod-hdl-fixed.cpp - OPV transmitter matching HDL modulator exactly
  * 
- * The HDL msk_modulator uses two NCOs (F1 and F2) running continuously,
- * with amplitude/polarity control (d_s1, d_s2) that can be +1, -1, or 0.
- * Only one tone is active at a time, and the polarity maintains phase coherence.
+ * FIXES from original:
+ * 1. Convolutional encoder masks: 0x4F/0x6D (not 0x79/0x5B)
+ * 2. Base-40 callsign encoding (not ASCII)
+ * 3. Proper OPV header format
  * 
- * Output = sin(F1)*d_s1 + sin(F2)*d_s2
- * Where I=sin, Q=cos (HDL convention)
+ * Copyright 2026 Open Research Institute, Inc.
+ * SPDX-License-Identifier: CERN-OHL-S-2.0
  */
 
 #include <iostream>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <cmath>
 #include <array>
+#include <string>
 #include <getopt.h>
 
 // =============================================================================
@@ -31,9 +33,10 @@ constexpr size_t SAMPLES_PER_SYMBOL = 40;
 constexpr double SAMPLE_RATE = 2168000.0;
 constexpr double SYMBOL_RATE = 54200.0;
 constexpr double FREQ_DEV = SYMBOL_RATE / 4.0;  // 13550 Hz
+
 bool g_verbose = false;
-constexpr double F1_FREQ = -FREQ_DEV;  // Lower tone
-constexpr double F2_FREQ = +FREQ_DEV;  // Upper tone
+constexpr double F1_FREQ = -FREQ_DEV;  // Lower tone (bit '1')
+constexpr double F2_FREQ = +FREQ_DEV;  // Upper tone (bit '0')
 
 constexpr double PI = 3.14159265358979323846;
 constexpr double TWO_PI = 2.0 * PI;
@@ -46,6 +49,44 @@ using frame_t = std::array<uint8_t, FRAME_BYTES>;
 using encoded_bits_t = std::array<uint8_t, ENCODED_BITS>;
 
 struct IQSample { int16_t I, Q; };
+
+// =============================================================================
+// BASE-40 CALLSIGN ENCODER
+// =============================================================================
+
+class Base40Encoder {
+public:
+    // Encode callsign string to 6-byte Base-40 value
+    // HDL convention: first character in least significant position
+    static void encode(const std::string& callsign, uint8_t* out) {
+        uint64_t value = 0;
+        
+        // Iterate in reverse to put first char in LSB position (HDL convention)
+        for (int i = callsign.length() - 1; i >= 0; --i) {
+            value *= 40;
+            value += char_to_digit(callsign[i]);
+        }
+        
+        // Pack into 6 bytes (big-endian)
+        out[0] = (value >> 40) & 0xFF;
+        out[1] = (value >> 32) & 0xFF;
+        out[2] = (value >> 24) & 0xFF;
+        out[3] = (value >> 16) & 0xFF;
+        out[4] = (value >> 8) & 0xFF;
+        out[5] = value & 0xFF;
+    }
+    
+private:
+    static int char_to_digit(char c) {
+        if (c >= 'A' && c <= 'Z') return c - 'A' + 1;
+        if (c >= 'a' && c <= 'z') return c - 'a' + 1;  // Accept lowercase
+        if (c >= '0' && c <= '9') return c - '0' + 27;
+        if (c == '-') return 37;
+        if (c == '/') return 38;
+        if (c == '.') return 39;
+        return 0;  // Unknown -> unused
+    }
+};
 
 // =============================================================================
 // CCSDS LFSR RANDOMIZER
@@ -71,6 +112,7 @@ private:
 
 // =============================================================================
 // CONVOLUTIONAL ENCODER (K=7, Rate 1/2)
+// FIXED: Uses correct polynomial masks matching HDL's bit indexing
 // =============================================================================
 
 class ConvEncoder {
@@ -79,9 +121,11 @@ public:
     
     void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
         uint8_t state = (in << 6) | sr;
-        // G1 = 171 octal = 0x79, G2 = 133 octal = 0x5B
-        g1 = __builtin_parity(state & 0x79);
-        g2 = __builtin_parity(state & 0x5B);
+        // FIXED: HDL uses 6-i indexing, so:
+        // G1 = 171 octal = 1111001 -> mask = 0x4F (not 0x79!)
+        // G2 = 133 octal = 1011011 -> mask = 0x6D (not 0x5B!)
+        g1 = __builtin_parity(state & 0x4F);
+        g2 = __builtin_parity(state & 0x6D);
         sr = ((sr << 1) | in) & 0x3F;
     }
     
@@ -90,13 +134,18 @@ private:
 };
 
 // =============================================================================
-// 67x32 BIT INTERLEAVER
+// 67x32 BIT INTERLEAVER (with MSB-first byte correction to match HDL)
 // =============================================================================
 
 void interleave(encoded_bits_t& bits) {
-    encoded_bits_t temp = {};  // Initialize to zero
+    encoded_bits_t temp = {};
     for (size_t i = 0; i < ENCODED_BITS; ++i) {
-        temp[(i % 32) * 67 + (i / 32)] = bits[i];
+        size_t interleaved_pos = (i % 32) * 67 + (i / 32);
+        // Apply MSB-first byte correction (same as demodulator expects)
+        size_t byte_num = interleaved_pos / 8;
+        size_t bit_in_byte = interleaved_pos % 8;
+        size_t corrected_pos = byte_num * 8 + (7 - bit_in_byte);
+        temp[corrected_pos] = bits[i];
     }
     bits = temp;
 }
@@ -108,15 +157,22 @@ void interleave(encoded_bits_t& bits) {
 encoded_bits_t encode_frame(const frame_t& payload) {
     LFSR lfsr; lfsr.reset();
     ConvEncoder conv; conv.reset();
-    encoded_bits_t encoded = {};  // Initialize
+    encoded_bits_t encoded = {};
     size_t out_idx = 0;
     
+    // Randomize payload
     std::array<uint8_t, FRAME_BYTES> randomized;
     for (size_t i = 0; i < FRAME_BYTES; ++i) {
         randomized[i] = payload[i] ^ lfsr.next_byte();
     }
     
     if (g_verbose) {
+        std::cerr << "Payload[0:11]: ";
+        for (int i = 0; i < 12; ++i) {
+            std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)payload[i] << " ";
+        }
+        std::cerr << std::dec << "\n";
+        
         std::cerr << "Randomized[0:5]: ";
         for (int i = 0; i < 6; ++i) {
             std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)randomized[i] << " ";
@@ -124,15 +180,9 @@ encoded_bits_t encode_frame(const frame_t& payload) {
         std::cerr << std::dec << "\n";
     }
     
+    // Encode from last byte to first (HDL byte order)
     for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
         uint8_t byte = randomized[byte_idx];
-        
-        if (g_verbose && byte_idx == FRAME_BYTES - 1) {
-            std::cerr << "First byte to encode: randomized[" << byte_idx << "] = 0x" 
-                      << std::hex << (int)byte << std::dec << " = ";
-            for (int i = 7; i >= 0; --i) std::cerr << ((byte >> i) & 1);
-            std::cerr << "\n";
-        }
         
         for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
             uint8_t g1, g2;
@@ -140,13 +190,6 @@ encoded_bits_t encode_frame(const frame_t& payload) {
             conv.encode_bit(in_bit, g1, g2);
             encoded[out_idx++] = g1;
             encoded[out_idx++] = g2;
-            
-            // Debug first 8 input bits
-            if (g_verbose && out_idx <= 16) {
-                std::cerr << "  byte[" << byte_idx << "] bit[" << bit_pos << "] = " << (int)in_bit
-                          << " -> G1=" << (int)g1 << " G2=" << (int)g2 
-                          << " (idx " << out_idx-2 << "," << out_idx-1 << ")\n";
-            }
         }
     }
     
@@ -169,11 +212,6 @@ encoded_bits_t encode_frame(const frame_t& payload) {
 
 // =============================================================================
 // HDL-ACCURATE PARALLEL-TONE MSK MODULATOR
-// 
-// Matches msk_modulator.vhd logic exactly:
-// - Two NCOs running at F1 and F2
-// - Differential encoding determines which tone is active
-// - Tone polarity (±1) determined by b_n and d_val_xor_T
 // =============================================================================
 
 class HDLModulator {
@@ -181,52 +219,45 @@ public:
     void reset() {
         phase_f1 = 0.0;
         phase_f2 = 0.0;
-        d_val_xor_T = 0;  // "000" initially
-        b_n = 1;          // '1' initially
+        d_val_xor_T = 0;
+        b_n = 1;
     }
     
     void modulate_bit(uint8_t tx_bit, std::array<IQSample, SAMPLES_PER_SYMBOL>& output) {
-        // Compute d_val from tx_bit (lines 223)
+        // d_val mapping: determines which tone is active
+        // bit '0' -> d_val=+1 -> activates d_pos path (F1)
+        // bit '1' -> d_val=-1 -> activates d_neg path (F2)
         int8_t d_val = (tx_bit == 0) ? 1 : -1;
         
-        // Compute d_val_xor (lines 225-228)
         int8_t d_val_xor;
         if (d_val == 1 && d_val_xor_T == 1) d_val_xor = 1;
         else if (d_val == 1 && d_val_xor_T == -1) d_val_xor = -1;
         else if (d_val == -1 && d_val_xor_T == 1) d_val_xor = -1;
         else if (d_val == -1 && d_val_xor_T == -1) d_val_xor = 1;
-        else d_val_xor = 1;  // default when d_val_xor_T = 0
+        else d_val_xor = 1;
         
-        // Compute d_pos and d_neg (lines 230-231)
-        int8_t d_pos = (d_val + 1) >> 1;  // +1→1, -1→0
-        int8_t d_neg = (d_val - 1) >> 1;  // +1→0, -1→-1
+        int8_t d_pos = (d_val + 1) >> 1;
+        int8_t d_neg = (d_val - 1) >> 1;
         
-        // Compute d_pos_enc and d_neg_enc (lines 233-234)
         int8_t d_pos_enc = d_pos;
         int8_t d_neg_enc = (b_n == 0) ? d_neg : -d_neg;
         
-        // Compute d_s1/d_s2 using current d_val_xor_T (updated at end of prev symbol)
         int8_t d_s1, d_s2;
         
-        // d_pos_xor (F1 amplitude)
         if (d_pos_enc == 1 && d_val_xor_T == 1) d_s1 = 1;
         else if (d_pos_enc == 1 && d_val_xor_T == -1) d_s1 = -1;
         else d_s1 = 0;
         
-        // d_neg_xor (F2 amplitude)
         if (d_neg_enc == -1 && d_val_xor_T == 1) d_s2 = -1;
         else if (d_neg_enc == -1 && d_val_xor_T == -1) d_s2 = 1;
         else if (d_neg_enc == 1 && d_val_xor_T == 1) d_s2 = 1;
         else if (d_neg_enc == 1 && d_val_xor_T == -1) d_s2 = -1;
         else d_s2 = 0;
         
-        // Generate samples
         double phase_inc_f1 = TWO_PI * F1_FREQ / SAMPLE_RATE;
         double phase_inc_f2 = TWO_PI * F2_FREQ / SAMPLE_RATE;
         
         for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
-            // HDL: tx_samples_I = s1s + s2s (sin components)
-            //      tx_samples_Q = s1c + s2c (cos components)
             double sin_f1 = std::sin(phase_f1);
             double cos_f1 = std::cos(phase_f1);
             double sin_f2 = std::sin(phase_f2);
@@ -238,7 +269,6 @@ public:
             output[i].I = static_cast<int16_t>(16383.0 * I);
             output[i].Q = static_cast<int16_t>(16383.0 * Q);
             
-            // Update NCO phases
             phase_f1 += phase_inc_f1;
             phase_f2 += phase_inc_f2;
             while (phase_f1 > PI) phase_f1 -= TWO_PI;
@@ -247,10 +277,7 @@ public:
             while (phase_f2 < -PI) phase_f2 += TWO_PI;
         }
         
-        // Update state for next symbol
         d_val_xor_T = d_val_xor;
-        
-        // Toggle b_n for next symbol
         b_n = 1 - b_n;
     }
     
@@ -294,36 +321,36 @@ void send_sync_word() {
 void send_encoded_frame(const encoded_bits_t& encoded) {
     std::array<IQSample, SAMPLES_PER_SYMBOL> samples;
     
-    // DEBUG: Print first few encoded bits
     if (g_verbose) {
-        std::cerr << "Encoded bits [0:9]: ";
-        for (int i = 0; i < 10; ++i) std::cerr << (int)encoded[i];
+        std::cerr << "Encoded bits [0:31]: ";
+        for (int i = 0; i < 32; ++i) std::cerr << (int)encoded[i];
         std::cerr << "\n";
     }
     
-    // Send bits in linear order
     for (size_t i = 0; i < ENCODED_BITS; ++i) {
         g_mod.modulate_bit(encoded[i], samples);
         output(samples);
     }
 }
 
-frame_t build_bert_frame(const char* callsign, uint32_t frame_num) {
+// Build OPV frame with proper Base-40 callsign encoding
+frame_t build_opv_frame(const std::string& callsign, uint32_t token, uint32_t frame_num) {
     frame_t frame = {};
     
-    size_t len = strlen(callsign);
-    for (size_t i = 0; i < 6 && i < len; ++i) {
-        frame[i] = callsign[i];
-    }
+    // Station ID: 6 bytes Base-40 encoded
+    Base40Encoder::encode(callsign, &frame[0]);
     
-    frame[6] = (frame_num >> 16) & 0xFF;
-    frame[7] = (frame_num >> 8) & 0xFF;
-    frame[8] = frame_num & 0xFF;
+    // Token: 3 bytes (default 0xBBAADD)
+    frame[6] = (token >> 16) & 0xFF;
+    frame[7] = (token >> 8) & 0xFF;
+    frame[8] = token & 0xFF;
     
+    // Reserved: 3 bytes
     frame[9] = 0;
     frame[10] = 0;
     frame[11] = 0;
     
+    // Payload: fill with test pattern (frame counter + index)
     for (size_t i = 0; i < FRAME_BYTES - 12; ++i) {
         frame[12 + i] = (frame_num + i) & 0xFF;
     }
@@ -336,20 +363,29 @@ frame_t build_bert_frame(const char* callsign, uint32_t frame_num) {
 // =============================================================================
 
 void usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " -S CALLSIGN -B FRAMES [-r] [-c] [-v]\n";
+    std::cerr << "Usage: " << prog << " -S CALLSIGN -B FRAMES [-t TOKEN] [-r] [-c] [-v]\n\n";
+    std::cerr << "Options:\n";
+    std::cerr << "  -S CALLSIGN   Station callsign (e.g., W5NYV, UM5BK)\n";
+    std::cerr << "  -B FRAMES     Number of BERT frames to transmit\n";
+    std::cerr << "  -t TOKEN      24-bit token (default: 0xBBAADD)\n";
+    std::cerr << "  -r            Reset modulator per frame\n";
+    std::cerr << "  -c            Continuous mode (loop forever)\n";
+    std::cerr << "  -v            Verbose output\n";
     exit(1);
 }
 
 int main(int argc, char* argv[]) {
-    const char* callsign = nullptr;
+    std::string callsign;
     int bert_frames = 0;
     bool continuous = false;
+    uint32_t token = 0xBBAADD;  // Default token
     
     int opt;
-    while ((opt = getopt(argc, argv, "S:B:rcvh")) != -1) {
+    while ((opt = getopt(argc, argv, "S:B:t:rcvh")) != -1) {
         switch (opt) {
             case 'S': callsign = optarg; break;
             case 'B': bert_frames = std::atoi(optarg); break;
+            case 't': token = std::strtoul(optarg, nullptr, 0); break;
             case 'r': g_reset_per_frame = true; break;
             case 'c': continuous = true; break;
             case 'v': g_verbose = true; break;
@@ -357,14 +393,23 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (!callsign || bert_frames <= 0) {
+    if (callsign.empty() || bert_frames <= 0) {
         usage(argv[0]);
     }
     
+    // Validate callsign length (max ~9 chars for 48-bit Base-40)
+    if (callsign.length() > 9) {
+        std::cerr << "Warning: Callsign truncated to 9 characters for Base-40 encoding\n";
+        callsign = callsign.substr(0, 9);
+    }
+    
     if (g_verbose) {
-        std::cerr << "OPV Transmitter (HDL-accurate parallel-tone MSK)\n";
+        std::cerr << "OPV Transmitter (HDL-accurate, FIXED)\n";
         std::cerr << "  Callsign: " << callsign << "\n";
+        std::cerr << "  Token:    0x" << std::hex << token << std::dec << "\n";
         std::cerr << "  BERT frames: " << bert_frames << "\n";
+        std::cerr << "  Conv encoder masks: G1=0x4F, G2=0x6D\n";
+        std::cerr << "\n";
     }
     
     uint32_t frame_num = 0;
@@ -377,7 +422,7 @@ int main(int argc, char* argv[]) {
                 g_mod.reset();
             }
             
-            frame_t frame = build_bert_frame(callsign, frame_num++);
+            frame_t frame = build_opv_frame(callsign, token, frame_num++);
             encoded_bits_t encoded = encode_frame(frame);
             
             send_sync_word();
@@ -390,6 +435,7 @@ int main(int argc, char* argv[]) {
         
     } while (continuous);
     
+    // Trailing zeros
     std::array<IQSample, SAMPLES_PER_SYMBOL> zeros = {};
     for (int i = 0; i < 100; ++i) output(zeros);
     
