@@ -1,42 +1,6 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+bin/
 *.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# cmake build directory
-build
-
-# tools storage directories
-.vscode
-.ipynb_checkpoints
-
-# Macintosh leavings
 .DS_Store
+*.swp
+*.iq
+*.log
