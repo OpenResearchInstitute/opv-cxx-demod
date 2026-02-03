@@ -225,8 +225,8 @@ encoded_t conv_encode(const frame_t& frame) {
     size_t out_idx = 0;
     uint8_t shift_reg = 0;
     
-    // FIXED: Process bytes FORWARD (0→133) to match HDL
-    // HDL encoder reads bytes starting from byte 0
+    // FIXED: Process bytes in FORWARD order (0→133)
+    // Simulation proved this is correct for software Viterbi decoder
     for (size_t byte_idx = 0; byte_idx < OPV_FRAME_BYTES; ++byte_idx) {
         uint8_t byte = frame[byte_idx];
         
@@ -245,8 +245,7 @@ encoded_t conv_encode(const frame_t& frame) {
         }
     }
     
-    // NOTE: reverse_fec() is called separately after this function
-    // to match HDL line 589: fec_buffer(i) <= encoder_output_buf(ENCODED_BITS - 1 - i)
+    // NO reversal needed - forward byte order is correct
     return encoded;
 }
 
@@ -460,10 +459,6 @@ if (i == 0) {
         std::cerr << "Wrote pre-interleave bits to /tmp/pre_interleave.bin\n";
     }
 }
-        
-        // CRITICAL FIX: Reverse FEC output to match HDL
-        // HDL (ov_frame_encoder.vhd line 589): fec_buffer(i) <= encoder_output_buf(ENCODED_BITS - 1 - i)
-        reverse_fec(encoded);
         
         // Interleave
         interleave(encoded);
