@@ -102,7 +102,7 @@ std::string decode_base40(const uint8_t* bytes, size_t len = 6) {
 }
 
 //------------------------------------------------------------------------------
-// MSK Demodulator with AFC
+// MSK Demodulator with AFC (Non-coherent energy detection)
 //------------------------------------------------------------------------------
 class MSKDemodulatorAFC {
 public:
@@ -266,6 +266,230 @@ private:
     double phase_f1_, phase_f2_;
     std::complex<double> prev_corr_f1_, prev_corr_f2_;
     double afc_alpha_;
+};
+
+//------------------------------------------------------------------------------
+// Coherent MSK Demodulator with Costas Loop
+//------------------------------------------------------------------------------
+// This demodulator recovers carrier phase using a decision-directed Costas loop.
+// Instead of energy detection (|corr|²), it uses the real part of phase-aligned
+// correlations, providing ~3dB improvement at low SNR.
+//
+// Architecture:
+//   1. Correlate with F1 and F2 tones (same as non-coherent)
+//   2. Track carrier phase using Costas loop feedback
+//   3. Rotate correlations to align with reference phase
+//   4. Soft decision = Re(corr_f2) - Re(corr_f1) (signed, not magnitude!)
+//
+// The differential encoding in OPV resolves the 180° phase ambiguity.
+//------------------------------------------------------------------------------
+class CoherentMSKDemodulator {
+public:
+    CoherentMSKDemodulator() 
+        : freq_offset_(0), carrier_phase_(0),
+          phase_f1_(0), phase_f2_(0),
+          loop_freq_(0),
+          afc_alpha_(0.001),
+          // Costas loop gains (2nd order loop)
+          // BW ~= 0.01 * symbol_rate for acquisition, narrower for tracking
+          pll_alpha_(0.01),    // Phase gain (proportional)
+          pll_beta_(0.001)     // Frequency gain (integral)
+    {}
+    
+    // Estimate carrier offset from spectrum (coarse AFC) - same as non-coherent
+    double estimate_offset(const sample_t* samples, size_t num_samples) {
+        double best_offset = 0;
+        double best_energy = 0;
+        
+        for (double offset = -1500; offset <= 1500; offset += 25) {
+            double phase_f1 = 0, phase_f2 = 0;
+            double phase_inc_f1 = TWO_PI * (-FREQ_DEV + offset) / SAMPLE_RATE;
+            double phase_inc_f2 = TWO_PI * (+FREQ_DEV + offset) / SAMPLE_RATE;
+            
+            double total_energy = 0;
+            size_t test_samples = std::min(num_samples, size_t(SAMPLES_PER_SYMBOL * 1000));
+            
+            for (size_t sym = 0; sym < test_samples / SAMPLES_PER_SYMBOL; ++sym) {
+                std::complex<double> corr_f1(0), corr_f2(0);
+                
+                for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
+                    size_t idx = sym * SAMPLES_PER_SYMBOL + i;
+                    std::complex<double> lo_f1(std::cos(phase_f1), std::sin(phase_f1));
+                    std::complex<double> lo_f2(std::cos(phase_f2), std::sin(phase_f2));
+                    
+                    corr_f1 += samples[idx] * std::conj(lo_f1);
+                    corr_f2 += samples[idx] * std::conj(lo_f2);
+                    
+                    phase_f1 += phase_inc_f1;
+                    phase_f2 += phase_inc_f2;
+                }
+                
+                total_energy += std::norm(corr_f1) + std::norm(corr_f2);
+            }
+            
+            if (total_energy > best_energy) {
+                best_energy = total_energy;
+                best_offset = offset;
+            }
+        }
+        
+        // Fine tune
+        double fine_best = best_offset;
+        for (double offset = best_offset - 30; offset <= best_offset + 30; offset += 5) {
+            double phase_f1 = 0, phase_f2 = 0;
+            double phase_inc_f1 = TWO_PI * (-FREQ_DEV + offset) / SAMPLE_RATE;
+            double phase_inc_f2 = TWO_PI * (+FREQ_DEV + offset) / SAMPLE_RATE;
+            
+            double total_energy = 0;
+            size_t test_samples = std::min(num_samples, size_t(SAMPLES_PER_SYMBOL * 1000));
+            
+            for (size_t sym = 0; sym < test_samples / SAMPLES_PER_SYMBOL; ++sym) {
+                std::complex<double> corr_f1(0), corr_f2(0);
+                
+                for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
+                    size_t idx = sym * SAMPLES_PER_SYMBOL + i;
+                    std::complex<double> lo_f1(std::cos(phase_f1), std::sin(phase_f1));
+                    std::complex<double> lo_f2(std::cos(phase_f2), std::sin(phase_f2));
+                    
+                    corr_f1 += samples[idx] * std::conj(lo_f1);
+                    corr_f2 += samples[idx] * std::conj(lo_f2);
+                    
+                    phase_f1 += phase_inc_f1;
+                    phase_f2 += phase_inc_f2;
+                }
+                
+                total_energy += std::norm(corr_f1) + std::norm(corr_f2);
+            }
+            
+            if (total_energy > best_energy) {
+                best_energy = total_energy;
+                fine_best = offset;
+            }
+        }
+        
+        return fine_best;
+    }
+    
+    void set_freq_offset(double offset) { freq_offset_ = offset; }
+    
+    void demodulate(const sample_t* samples, size_t num_samples,
+                    std::vector<double>& soft_out) {
+        soft_out.clear();
+        
+        double phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+        double phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+        
+        for (size_t sym = 0; sym < num_samples / SAMPLES_PER_SYMBOL; ++sym) {
+            std::complex<double> corr_f1(0, 0), corr_f2(0, 0);
+            
+            // Integrate over symbol with carrier phase correction
+            for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
+                size_t idx = sym * SAMPLES_PER_SYMBOL + i;
+                
+                // Apply carrier phase correction to the sample
+                std::complex<double> phase_rot(std::cos(carrier_phase_), -std::sin(carrier_phase_));
+                std::complex<double> corrected = samples[idx] * phase_rot;
+                
+                // Correlate with F1 and F2 tones
+                std::complex<double> lo_f1(std::cos(phase_f1_), std::sin(phase_f1_));
+                std::complex<double> lo_f2(std::cos(phase_f2_), std::sin(phase_f2_));
+                
+                corr_f1 += corrected * std::conj(lo_f1);
+                corr_f2 += corrected * std::conj(lo_f2);
+                
+                phase_f1_ += phase_inc_f1;
+                phase_f2_ += phase_inc_f2;
+                
+                // Advance carrier phase by loop frequency correction
+                carrier_phase_ += loop_freq_;
+            }
+            
+            // Wrap phases
+            while (phase_f1_ > PI) phase_f1_ -= TWO_PI;
+            while (phase_f1_ < -PI) phase_f1_ += TWO_PI;
+            while (phase_f2_ > PI) phase_f2_ -= TWO_PI;
+            while (phase_f2_ < -PI) phase_f2_ += TWO_PI;
+            while (carrier_phase_ > PI) carrier_phase_ -= TWO_PI;
+            while (carrier_phase_ < -PI) carrier_phase_ += TWO_PI;
+            
+            // Determine which tone is dominant (for phase error computation)
+            double f1_energy = std::norm(corr_f1);
+            double f2_energy = std::norm(corr_f2);
+            
+            // ===== COHERENT SOFT DECISION =====
+            // Use REAL parts (phase-sensitive), not magnitudes
+            // With proper phase tracking, the correlations should be mostly real
+            double soft_f1 = corr_f1.real();
+            double soft_f2 = corr_f2.real();
+            
+            // Soft decision: positive = F2 (bit 0), negative = F1 (bit 1)
+            // The sign now carries phase information!
+            soft_out.push_back(soft_f2 - soft_f1);
+            
+            // ===== COSTAS LOOP PHASE ERROR =====
+            // Decision-directed: use the dominant tone's phase to track carrier
+            // Phase error = Im(corr) / Re(corr) for small angles ≈ atan2(Im, Re)
+            std::complex<double> dominant = (f1_energy > f2_energy) ? corr_f1 : corr_f2;
+            
+            // Normalized phase error (avoid division by zero)
+            double mag = std::abs(dominant);
+            double phase_error = 0;
+            if (mag > 1e-10) {
+                // For decision-directed, we want the correlation to be real and positive
+                // But MSK alternates phase by ±90° per symbol, so we track that
+                // Simple approach: drive imaginary part to zero
+                phase_error = dominant.imag() / mag;  // sin(error) ≈ error for small angles
+            }
+            
+            // ===== LOOP FILTER (2nd order) =====
+            // Updates both phase and frequency estimates
+            loop_freq_ += pll_beta_ * phase_error;  // Integral path (frequency)
+            carrier_phase_ += pll_alpha_ * phase_error;  // Proportional path (phase)
+            
+            // Limit loop frequency to avoid runaway
+            loop_freq_ = std::clamp(loop_freq_, -0.1, 0.1);
+            
+            // ===== AFC: COARSE FREQUENCY TRACKING =====
+            // This helps when residual offset exceeds PLL pull-in range
+            // Use phase rotation of dominant tone between symbols
+            if (sym > 0) {
+                double phase_diff = std::arg(dominant * std::conj(prev_dominant_));
+                double freq_err = phase_diff * SYMBOL_RATE / TWO_PI;
+                freq_offset_ += afc_alpha_ * freq_err;
+                freq_offset_ = std::clamp(freq_offset_, -2000.0, 2000.0);
+                
+                phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+                phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+            }
+            
+            prev_dominant_ = dominant;
+        }
+    }
+    
+    double get_freq_offset() const { return freq_offset_; }
+    void set_afc_bandwidth(double alpha) { afc_alpha_ = alpha; }
+    
+    // Set Costas loop bandwidth
+    // Wider bandwidth: faster acquisition, more noise
+    // Narrower bandwidth: better noise rejection, slower tracking
+    void set_pll_bandwidth(double bw) {
+        // Natural frequency ωn and damping ζ for 2nd order loop
+        // bw ≈ ωn / (2π) for critically damped loop
+        double wn = bw * TWO_PI;
+        double zeta = 0.707;  // Critically damped
+        pll_alpha_ = 2.0 * zeta * wn / SYMBOL_RATE;
+        pll_beta_ = wn * wn / (SYMBOL_RATE * SYMBOL_RATE);
+    }
+
+private:
+    double freq_offset_;
+    double carrier_phase_;      // Carrier phase estimate
+    double phase_f1_, phase_f2_;
+    double loop_freq_;          // Loop frequency correction (radians per sample)
+    std::complex<double> prev_dominant_;
+    double afc_alpha_;
+    double pll_alpha_;          // Phase error gain
+    double pll_beta_;           // Frequency error gain
 };
 
 //------------------------------------------------------------------------------
@@ -638,19 +862,33 @@ void print_frame(int num, const std::array<uint8_t, FRAME_BYTES>& f, int metric,
 // Main
 //------------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    bool quiet = false, raw = false;
+    bool quiet = false, raw = false, coherent = false, streaming = false;
     double afc_bw = 0.001;
+    double pll_bw = 50.0;  // PLL bandwidth in Hz
+    double init_offset = 0.0;  // Initial frequency offset for streaming mode
+    bool have_init_offset = false;
     
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-q")) quiet = true;
         else if (!strcmp(argv[i], "-r")) raw = true;
+        else if (!strcmp(argv[i], "-c")) coherent = true;
+        else if (!strcmp(argv[i], "-s")) streaming = true;
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) afc_bw = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) pll_bw = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+            init_offset = atof(argv[++i]);
+            have_init_offset = true;
+        }
         else if (!strcmp(argv[i], "-h")) {
             fprintf(stderr, "Usage: %s [options] < input.iq\n\n", argv[0]);
             fprintf(stderr, "Options:\n");
             fprintf(stderr, "  -q          Quiet mode\n");
             fprintf(stderr, "  -r          Raw output to stdout\n");
+            fprintf(stderr, "  -s          Streaming mode (for live PlutoSDR input)\n");
+            fprintf(stderr, "  -c          Coherent mode (Costas loop, ~3dB better)\n");
             fprintf(stderr, "  -a <bw>     AFC bandwidth (default: 0.001)\n");
+            fprintf(stderr, "  -o <hz>     Initial frequency offset (streaming mode)\n");
+            fprintf(stderr, "  -p <hz>     PLL bandwidth in Hz (default: 50, coherent only)\n");
             fprintf(stderr, "  -h          Help\n");
             return 0;
         }
@@ -658,9 +896,143 @@ int main(int argc, char* argv[]) {
     
     if (!quiet) {
         fprintf(stderr, "╔═══════════════════════════════════════════════════════════════════╗\n");
-        fprintf(stderr, "║           OPV MSK Demodulator with AFC v1.0                       ║\n");
+        if (coherent)
+            fprintf(stderr, "║       OPV MSK Demodulator with Costas Loop v1.0 (coherent)       ║\n");
+        else if (streaming)
+            fprintf(stderr, "║       OPV MSK Demodulator with AFC v1.0 (streaming)              ║\n");
+        else
+            fprintf(stderr, "║           OPV MSK Demodulator with AFC v1.0                       ║\n");
         fprintf(stderr, "╚═══════════════════════════════════════════════════════════════════╝\n\n");
     }
+    
+    // =========================================================================
+    // STREAMING MODE - process data as it arrives
+    // =========================================================================
+    if (streaming) {
+        if (!quiet)
+            fprintf(stderr, "Streaming mode: processing data as it arrives...\n\n");
+        
+        MSKDemodulatorAFC demod;
+        SyncTracker tracker;
+        FrameDecoder fdec;
+        
+        // Set initial offset if provided, otherwise start at 0
+        if (have_init_offset) {
+            demod.set_freq_offset(init_offset);
+            if (!quiet)
+                fprintf(stderr, "Initial frequency offset: %.1f Hz\n", init_offset);
+        }
+        demod.set_afc_bandwidth(afc_bw);
+        
+        // Process in chunks of one frame worth of samples
+        const size_t CHUNK_SAMPLES = FRAME_SYMBOLS * SAMPLES_PER_SYMBOL;  // ~86720 samples
+        std::vector<sample_t> chunk_buf;
+        chunk_buf.reserve(CHUNK_SAMPLES);
+        
+        int decoded = 0, perfect = 0;
+        size_t total_samples = 0;
+        size_t total_symbols = 0;
+        bool first_chunk = true;
+        
+        IQSample iq;
+        while (std::cin.read(reinterpret_cast<char*>(&iq), sizeof(iq))) {
+            chunk_buf.push_back(sample_t(iq.I, iq.Q));
+            
+            // Process when we have a full chunk
+            if (chunk_buf.size() >= CHUNK_SAMPLES) {
+                total_samples += chunk_buf.size();
+                
+                // On first chunk, estimate frequency offset
+                if (first_chunk) {
+                    if (!have_init_offset) {
+                        double est_offset = demod.estimate_offset(chunk_buf.data(), chunk_buf.size());
+                        demod.set_freq_offset(est_offset);
+                        if (!quiet)
+                            fprintf(stderr, "Estimated carrier offset: %.1f Hz\n\n", est_offset);
+                    }
+                    first_chunk = false;
+                }
+                
+                // Demodulate chunk
+                std::vector<double> soft;
+                demod.demodulate(chunk_buf.data(), chunk_buf.size(), soft);
+                
+                // Process through sync tracker
+                for (size_t i = 0; i < soft.size(); ++i) {
+                    auto res = tracker.process(soft[i], total_symbols + i);
+                    
+                    if (res.frame_ready && !res.payload.empty()) {
+                        std::array<uint8_t, FRAME_BYTES> frame;
+                        int metric = fdec.decode(res.payload.data(), frame);
+                        
+                        if (metric >= 0) {
+                            decoded++;
+                            if (metric == 0) perfect++;
+                            
+                            if (!quiet)
+                                print_frame(decoded, frame, metric, res.sync_quality);
+                            
+                            if (raw)
+                                std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
+                            
+                            std::cout.flush();  // Flush immediately in streaming mode
+                        }
+                    }
+                }
+                
+                total_symbols += soft.size();
+                chunk_buf.clear();
+                
+                // Periodic status update
+                if (!quiet && (total_samples % (size_t)(SAMPLE_RATE * 5) < CHUNK_SAMPLES)) {
+                    fprintf(stderr, "[%.1fs] %zu symbols, %d frames (%d perfect), AFC: %.1f Hz\n",
+                            total_samples / SAMPLE_RATE, total_symbols, decoded, perfect,
+                            demod.get_freq_offset());
+                }
+            }
+        }
+        
+        // Process any remaining samples
+        if (!chunk_buf.empty()) {
+            std::vector<double> soft;
+            demod.demodulate(chunk_buf.data(), chunk_buf.size(), soft);
+            
+            for (size_t i = 0; i < soft.size(); ++i) {
+                auto res = tracker.process(soft[i], total_symbols + i);
+                
+                if (res.frame_ready && !res.payload.empty()) {
+                    std::array<uint8_t, FRAME_BYTES> frame;
+                    int metric = fdec.decode(res.payload.data(), frame);
+                    
+                    if (metric >= 0) {
+                        decoded++;
+                        if (metric == 0) perfect++;
+                        
+                        if (!quiet)
+                            print_frame(decoded, frame, metric, res.sync_quality);
+                        
+                        if (raw)
+                            std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
+                    }
+                }
+            }
+        }
+        
+        if (!quiet) {
+            fprintf(stderr, "\n════════════════════════════════════════════════════════════════════\n");
+            fprintf(stderr, "Summary: %d frames (%d perfect, %d errors)\n", decoded, perfect, decoded - perfect);
+            fprintf(stderr, "Total: %.3f sec, %zu symbols\n", total_samples / SAMPLE_RATE, total_symbols);
+            fprintf(stderr, "Final state: %s, AFC: %.1f Hz\n", 
+                    state_name(tracker.get_state()), demod.get_freq_offset());
+            fprintf(stderr, "════════════════════════════════════════════════════════════════════\n");
+        }
+        
+        return decoded > 0 ? 0 : 1;
+    }
+    
+    // =========================================================================
+    // BATCH MODE - load all samples then process (original behavior)
+    // =========================================================================
     
     // Load samples
     std::vector<sample_t> samples;
@@ -671,23 +1043,46 @@ int main(int argc, char* argv[]) {
     if (!quiet)
         fprintf(stderr, "Loaded %zu samples (%.3f sec)\n", samples.size(), samples.size() / SAMPLE_RATE);
     
-    // Demodulate
-    MSKDemodulatorAFC demod;
-    
-    // Estimate carrier offset from spectrum (coarse AFC)
-    double est_offset = demod.estimate_offset(samples.data(), samples.size());
-    demod.set_freq_offset(est_offset);
-    
-    if (!quiet)
-        fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
-    
-    demod.set_afc_bandwidth(afc_bw);
+    // Demodulate using selected mode
     std::vector<double> soft;
-    demod.demodulate(samples.data(), samples.size(), soft);
+    double final_offset;
+    
+    if (coherent) {
+        // Coherent demodulation with Costas loop
+        CoherentMSKDemodulator demod;
+        
+        double est_offset = demod.estimate_offset(samples.data(), samples.size());
+        demod.set_freq_offset(est_offset);
+        
+        if (!quiet)
+            fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
+        
+        demod.set_afc_bandwidth(afc_bw);
+        demod.set_pll_bandwidth(pll_bw);
+        
+        if (!quiet)
+            fprintf(stderr, "PLL bandwidth: %.1f Hz\n", pll_bw);
+        
+        demod.demodulate(samples.data(), samples.size(), soft);
+        final_offset = demod.get_freq_offset();
+    } else {
+        // Non-coherent energy detection (original)
+        MSKDemodulatorAFC demod;
+        
+        double est_offset = demod.estimate_offset(samples.data(), samples.size());
+        demod.set_freq_offset(est_offset);
+        
+        if (!quiet)
+            fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
+        
+        demod.set_afc_bandwidth(afc_bw);
+        demod.demodulate(samples.data(), samples.size(), soft);
+        final_offset = demod.get_freq_offset();
+    }
     
     if (!quiet)
         fprintf(stderr, "Demodulated %zu symbols, final AFC offset: %.1f Hz\n\n", 
-                soft.size(), demod.get_freq_offset());
+                soft.size(), final_offset);
     
     // Process through state machine
     SyncTracker tracker;
@@ -718,7 +1113,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "════════════════════════════════════════════════════════════════════\n");
         fprintf(stderr, "Summary: %d frames (%d perfect, %d errors)\n", decoded, perfect, decoded - perfect);
         fprintf(stderr, "Final state: %s, AFC: %.1f Hz\n", 
-                state_name(tracker.get_state()), demod.get_freq_offset());
+                state_name(tracker.get_state()), final_offset);
         fprintf(stderr, "════════════════════════════════════════════════════════════════════\n");
     }
     

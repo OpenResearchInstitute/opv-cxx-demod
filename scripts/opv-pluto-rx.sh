@@ -10,7 +10,7 @@
 #   ./opv-pluto-rx.sh -t 10                    # Receive for 10 seconds
 #   ./opv-pluto-rx.sh -n 21680000              # Receive 21.68M samples (10 sec)
 #   ./opv-pluto-rx.sh -o capture.iq            # Save raw IQ for debugging
-#   ./opv-pluto-rx.sh -f 144390000 -g 40       # 144.39 MHz, 40dB gain
+#   ./opv-pluto-rx.sh -f 905036750 -g 40       # 905.036750 MHz, 40dB gain
 #
 
 set -e
@@ -20,7 +20,7 @@ set -e
 # =============================================================================
 
 PLUTO_URI="ip:192.168.2.1"          # PlutoSDR address (USB or IP)
-RX_FREQ=435000000                    # RX frequency in Hz (435 MHz)
+RX_FREQ=905050000                    # RX frequency in Hz (905.05 MHz for OPV)
 SAMPLE_RATE=2168000                  # Must match OPV spec (2.168 MSPS)
 RX_GAIN=40                           # RX gain in dB (RF front-end only)
 BUFFER_SIZE=346880                   # One frame: 2168 bits * 40 samp/bit * 4 bytes/samp
@@ -28,13 +28,9 @@ DURATION=0                           # Capture duration in seconds (0 = continuo
 NUM_SAMPLES=0                        # Number of samples (0 = use duration or continuous)
 IQ_FILE=""                           # Save raw IQ to file (empty = don't save)
 VERBOSE=0                            # Verbose output
+FREQ_OFFSET=0                        # Initial frequency offset for demodulator
 
 # Path to opv-demod (adjust if needed)
-# NOTE: opv-demod-afc is the fixed version with:
-#   - Correct Viterbi polynomial masks (0x4F, 0x6D)
-#   - AFC (automatic frequency control)
-#   - Proper state machine (HUNTING/LOCKED)
-#   - Base-40 callsign decoding
 OPV_DEMOD="./opv-demod-afc"
 
 # =============================================================================
@@ -53,15 +49,16 @@ Options:
   -t, --time SECONDS     Capture duration in seconds (default: continuous)
   -n, --samples COUNT    Number of samples to capture (overrides -t)
   -o, --output FILE      Save raw IQ samples to file (for debugging)
+  -O, --offset HZ        Initial frequency offset for demodulator
   -u, --uri URI          PlutoSDR URI (default: $PLUTO_URI)
   -v, --verbose          Verbose output
   -h, --help             Show this help
 
 Examples:
-  $(basename "$0")                             # Receive at 435 MHz until Ctrl+C
+  $(basename "$0")                             # Receive at 905.05 MHz until Ctrl+C
   $(basename "$0") -t 10                       # Receive for 10 seconds
   $(basename "$0") -t 30 -o capture.iq         # 30 sec capture, save IQ
-  $(basename "$0") -f 144390000 -g 50          # 144.39 MHz with 50dB gain
+  $(basename "$0") -f 905036750 -g 50          # 905.036750 MHz with 50dB gain
 
 Decoded frames are written to stdout. Status messages go to stderr.
 To save decoded output:
@@ -97,6 +94,10 @@ while [[ $# -gt 0 ]]; do
             IQ_FILE="$2"
             shift 2
             ;;
+        -O|--offset)
+            FREQ_OFFSET="$2"
+            shift 2
+            ;;
         -u|--uri)
             PLUTO_URI="$2"
             shift 2
@@ -119,7 +120,7 @@ done
 # VALIDATION
 # =============================================================================
 
-# Find the demodulator binary
+# Find the demodulator binary - prefer opv-demod-afc
 if [[ ! -x "$OPV_DEMOD" ]]; then
     if [[ -x "./opv-demod-afc" ]]; then
         OPV_DEMOD="./opv-demod-afc"
@@ -129,12 +130,14 @@ if [[ ! -x "$OPV_DEMOD" ]]; then
         OPV_DEMOD="./opv-demod-fixed"
     elif [[ -x "./apps/opv-demod-afc" ]]; then
         OPV_DEMOD="./apps/opv-demod-afc"
+    elif [[ -x "./apps/opv-demod-full" ]]; then
+        OPV_DEMOD="./apps/opv-demod-full"
     elif [[ -x "./apps/opv-demod" ]]; then
         OPV_DEMOD="./apps/opv-demod"
     else
         echo "Error: Cannot find opv-demod-afc executable" >&2
         echo "Make sure you have built it and are in the right directory" >&2
-        echo "Build with: g++ -std=c++17 -O2 -o opv-demod-afc opv-demod-afc.cpp" >&2
+        echo "Build with: g++ -std=c++17 -O3 -o opv-demod-afc opv-demod-afc.cpp" >&2
         exit 1
     fi
 fi
@@ -178,9 +181,9 @@ error() {
 format_freq() {
     local freq=$1
     if [[ $freq -ge 1000000000 ]]; then
-        printf "%.3f GHz" "$(echo "scale=3; $freq/1000000000" | bc)"
+        printf "%.6f GHz" "$(echo "scale=6; $freq/1000000000" | bc)"
     elif [[ $freq -ge 1000000 ]]; then
-        printf "%.3f MHz" "$(echo "scale=3; $freq/1000000" | bc)"
+        printf "%.6f MHz" "$(echo "scale=6; $freq/1000000" | bc)"
     elif [[ $freq -ge 1000 ]]; then
         printf "%.3f kHz" "$(echo "scale=3; $freq/1000" | bc)"
     else
@@ -287,6 +290,12 @@ fi
 
 IIO_CMD="$IIO_CMD $IIO_READ_OPTS cf-ad9361-lpc"
 
+# Build demodulator command with streaming flag
+DEMOD_CMD="$OPV_DEMOD -s"
+if [[ $FREQ_OFFSET -ne 0 ]]; then
+    DEMOD_CMD="$DEMOD_CMD -o $FREQ_OFFSET"
+fi
+
 # =============================================================================
 # RECEIVE
 # =============================================================================
@@ -298,12 +307,12 @@ echo "==============================================" >&2
 echo "  Mode:       $MODE" >&2
 echo "  Frequency:  $(format_freq $RX_FREQ)" >&2
 echo "  Gain:       $RX_GAIN dB" >&2
-echo "  Demod:      $OPV_DEMOD" >&2
+echo "  Demod:      $DEMOD_CMD" >&2
 if [[ -n "$IQ_FILE" ]]; then
     echo "  IQ Output:  $IQ_FILE" >&2
 fi
 echo "" >&2
-echo "Command: $IIO_CMD | $OPV_DEMOD" >&2
+echo "Command: $IIO_CMD | $DEMOD_CMD" >&2
 echo "" >&2
 
 if [[ $NUM_SAMPLES -gt 0 ]]; then
@@ -316,7 +325,7 @@ echo "" >&2
 # Run the pipeline
 if [[ -n "$IQ_FILE" ]]; then
     # Save IQ and decode (tee to file)
-    $IIO_CMD | tee "$IQ_FILE" | "$OPV_DEMOD"
+    $IIO_CMD | tee "$IQ_FILE" | $DEMOD_CMD
     echo "" >&2
     echo "Raw IQ saved to: $IQ_FILE" >&2
     # Get file size (works on both Linux and macOS)
@@ -328,7 +337,7 @@ if [[ -n "$IQ_FILE" ]]; then
     fi
 else
     # Direct decode
-    $IIO_CMD | "$OPV_DEMOD"
+    $IIO_CMD | $DEMOD_CMD
 fi
 
 echo "" >&2
