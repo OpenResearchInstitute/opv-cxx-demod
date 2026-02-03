@@ -1,4 +1,5 @@
 // Copyright 2020 Mobilinkd LLC.
+// Copyright 2022-2026 Open Research Institute, Inc.
 
 #pragma once
 
@@ -8,6 +9,7 @@
 #include "Numerology.h"
 
 #include <array>
+#include <bitset>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -91,6 +93,9 @@ constexpr auto makeCost(Trellis_ trellis)
 /**
  * Soft decision Viterbi algorithm based on the trellis and LLR size.
  *
+ * Template parameters:
+ *   Trellis_ - The trellis type (determines K, k, n, and polynomials)
+ *   LLR_     - Log-likelihood ratio bit width (default 2, max 6)
  */
 template <typename Trellis_, size_t LLR_ = 2>
 struct Viterbi
@@ -115,10 +120,14 @@ struct Viterbi
 
     metrics_t prevMetrics, currMetrics;
 
-    // This is the maximum amount of storage needed for M17.  If used for
-    // other modes, this may need to be increased.  This will never overflow
-    // because of a static assertion in the decode() function.
-    std::array<std::bitset<NumStates>, stream_type3_payload_size / 2> history_;   //!!! revise for OPV (crashing) was 244 for M17
+    // History buffer for traceback.
+    // Size must accommodate the largest frame we'll decode:
+    //   - OPV: opv_encoded_bits / 2 = 2144 / 2 = 1072 entries
+    //   - Legacy: stream_type3_payload_size / 2 = 1960 / 2 = 980 entries
+    // Use the larger of the two to support both modes.
+    // The static_assert in decode() verifies the buffer is large enough.
+    static constexpr size_t HISTORY_SIZE = opv_encoded_bits / 2;  // 1072 entries
+    std::array<std::bitset<NumStates>, HISTORY_SIZE> history_;
 
     Viterbi(Trellis_ trellis)
     : cost_(makeCost<Trellis_, LLR_>(trellis))
@@ -158,12 +167,16 @@ struct Viterbi
     /**
      * Viterbi soft decoder using LLR inputs where 0 == erasure.
      * 
-     * @return path metric for estimating BER.
+     * @tparam IN   Number of input soft bits (encoded)
+     * @tparam OUT  Number of output hard bits (decoded)
+     * @param in    Input soft decision values (LLR)
+     * @param out   Output decoded bits (one bit per byte, values 0 or 1)
+     * @return path metric for estimating BER
      */
     template <size_t IN, size_t OUT>
     size_t decode(std::array<int8_t, IN> const& in, std::array<uint8_t, OUT>& out)
     {
-        static_assert(sizeof(history_) >= IN / 2);
+        static_assert(HISTORY_SIZE >= IN / 2, "History buffer too small for input size");
 
         constexpr auto MAX_METRIC = std::numeric_limits<typename metrics_t::value_type>::max() / 2;
 

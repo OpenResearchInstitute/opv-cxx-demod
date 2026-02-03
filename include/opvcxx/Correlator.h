@@ -1,4 +1,5 @@
 // Copyright 2021 Rob Riggs <rob@mobilinkd.com>
+// Copyright 2022-2026 Open Research Institute, Inc.
 // All rights reserved.
 
 #pragma once
@@ -21,7 +22,8 @@ namespace mobilinkd {
 template <typename FloatType>
 struct Correlator
 {
-	static constexpr size_t SYMBOLS = 8;
+	// Changed from 8 to 12 symbols for new 24-bit OPV sync word (0x02B8DB)
+	static constexpr size_t SYMBOLS = 12;
 	static constexpr size_t SAMPLES_PER_SYMBOL = 10;
 
 	using value_type = FloatType;
@@ -38,7 +40,6 @@ struct Correlator
     int code = -1;
 
     // IIR with Nyquist of 1/240.
-	// I'm not sure what that means.
 	// This is a Butterworth IIR lowpass filter, as designed by MATLAB's filter designer set for minimal taps.
 	// The numerator (which is [1 2 1] in normal form) has the scaling factor incorporated for unity gain.
 	static constexpr FloatType ugsf = 1.341681875516310e-06;	// unity gain scale factor
@@ -119,6 +120,9 @@ struct Correlator
     }
 };
 
+/**
+ * SyncWord detector using correlation
+ */
 template <typename Correlator>
 struct SyncWord
 {
