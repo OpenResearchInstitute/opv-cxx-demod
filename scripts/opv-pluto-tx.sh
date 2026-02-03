@@ -28,11 +28,8 @@ BERT_FRAMES=0                        # Number of BERT frames (0 = voice mode)
 CONTINUOUS=0                         # Continuous transmission mode
 VERBOSE=0                            # Verbose output
 
-# Path to opv-mod (adjust if needed)
-#OPV_MOD="./opv-mod-hdl-msk"
-#OPV_MOD="./opv-mod-fresh"
-#OPV_MOD="./opv-mod-cpfsk"
-OPV_MOD="./opv-mod-hdl"
+# Path to opv-mod - relative to repo root
+OPV_MOD="bin/opv-mod"
 
 # =============================================================================
 # USAGE
@@ -124,13 +121,13 @@ fi
 
 if [[ ! -x "$OPV_MOD" ]]; then
     # Try to find it in common locations
-    if [[ -x "./apps/opv-mod" ]]; then
-        OPV_MOD="./apps/opv-mod"
-    elif [[ -x "../build/apps/opv-mod" ]]; then
-        OPV_MOD="../build/apps/opv-mod"
+    if [[ -x "./bin/opv-mod" ]]; then
+        OPV_MOD="./bin/opv-mod"
+    elif [[ -x "../bin/opv-mod" ]]; then
+        OPV_MOD="../bin/opv-mod"
     else
         echo "Error: Cannot find opv-mod executable"
-        echo "Make sure you've built it and are in the right directory"
+        echo "Build with: make"
         exit 1
     fi
 fi

@@ -30,8 +30,8 @@ IQ_FILE=""                           # Save raw IQ to file (empty = don't save)
 VERBOSE=0                            # Verbose output
 FREQ_OFFSET=0                        # Initial frequency offset for demodulator
 
-# Path to opv-demod (adjust if needed)
-OPV_DEMOD="./opv-demod-afc"
+# Path to opv-demod - relative to repo root
+OPV_DEMOD="bin/opv-demod"
 
 # =============================================================================
 # USAGE
@@ -122,22 +122,14 @@ done
 
 # Find the demodulator binary - prefer opv-demod-afc
 if [[ ! -x "$OPV_DEMOD" ]]; then
-    if [[ -x "./opv-demod-afc" ]]; then
-        OPV_DEMOD="./opv-demod-afc"
-    elif [[ -x "./opv-demod-full" ]]; then
-        OPV_DEMOD="./opv-demod-full"
-    elif [[ -x "./opv-demod-fixed" ]]; then
-        OPV_DEMOD="./opv-demod-fixed"
-    elif [[ -x "./apps/opv-demod-afc" ]]; then
-        OPV_DEMOD="./apps/opv-demod-afc"
-    elif [[ -x "./apps/opv-demod-full" ]]; then
-        OPV_DEMOD="./apps/opv-demod-full"
-    elif [[ -x "./apps/opv-demod" ]]; then
-        OPV_DEMOD="./apps/opv-demod"
+    # Try to find it in common locations
+    if [[ -x "./bin/opv-demod" ]]; then
+        OPV_DEMOD="./bin/opv-demod"
+    elif [[ -x "../bin/opv-demod" ]]; then
+        OPV_DEMOD="../bin/opv-demod"
     else
-        echo "Error: Cannot find opv-demod-afc executable" >&2
-        echo "Make sure you have built it and are in the right directory" >&2
-        echo "Build with: g++ -std=c++17 -O3 -o opv-demod-afc opv-demod-afc.cpp" >&2
+        echo "Error: Cannot find opv-demod executable" >&2
+        echo "Build with: make" >&2
         exit 1
     fi
 fi
