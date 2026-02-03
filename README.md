@@ -133,10 +133,10 @@ opv-cxx-demod/
     └── filter-taps.ipynb   # Filter design
 ```
 
-## Compatibility
+## Interoperability
 
-- **Interlocutor**: Compatible with OPV HDL modems
-- **LibreSDR**: Tested with LibreSDR + PlutoSDR firmware
+- **Demodulates LibreSDR HDL modum Locutus transmissions
+- **Modulation To Be Tested with LibreSDR HDL modem Locutus receiving
 - **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
 
 ## Building
