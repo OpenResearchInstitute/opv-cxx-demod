@@ -84,7 +84,7 @@ Input: 16-bit I/Q samples (little-endian) from stdin
 
 Features:
   - Automatic Frequency Control (AFC)
-  - Symbol Timing Recovery (early-late gate TED)
+  - Symbol Timing Recovery (early-late gate timing error detector)
   - Soft-decision Viterbi decoding
   - Sync tracking with flywheel
 ```
