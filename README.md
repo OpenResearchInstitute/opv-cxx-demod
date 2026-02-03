@@ -135,8 +135,9 @@ opv-cxx-demod/
 
 ## Interoperability
 
-- **Demodulates LibreSDR HDL modum Locutus transmissions
-- **Modulation To Be Tested with LibreSDR HDL modem Locutus receiving
+- **Loopback** Successfully modulates and demodulates to itself
+- **Demodulates** LibreSDR HDL modum Locutus transmissions
+- **Modulation** To Be Tested with LibreSDR HDL modem Locutus receiving
 - **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
 
 ## Building
