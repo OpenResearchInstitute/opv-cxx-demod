@@ -1,7 +1,8 @@
 //------------------------------------------------------------------------------
-// opv-demod-afc.cpp - OPV MSK Demodulator with AFC and Sync State Machine
+// opv-demod-tr.cpp - OPV MSK Demodulator with AFC + Symbol Timing Recovery
 //------------------------------------------------------------------------------
-// MSK demodulator with automatic frequency control and proper sync tracking.
+// MSK demodulator with automatic frequency control, symbol timing recovery
+// (early-late gate TED with 2nd order loop), and proper sync tracking.
 // Uses correlation-based detection (robust) with frequency offset estimation
 // and correction (tracks drift).
 //
@@ -109,11 +110,25 @@ public:
     MSKDemodulatorAFC() 
         : freq_offset_(0), phase_f1_(0), phase_f2_(0),
           prev_corr_f1_(0), prev_corr_f2_(0),
-          afc_alpha_(0.001) {}
+          afc_alpha_(0.001),
+          // Timing recovery state
+          mu_(0.0),              // Fractional sample offset (0 to 1)
+          timing_freq_(0.0),     // Clock frequency offset estimate
+          alpha_timing_(0.005),  // Timing loop proportional gain
+          beta_timing_(0.00001)  // Timing loop integral gain
+    {}
+    
+    // Linear interpolation
+    sample_t interp(const sample_t* s, double idx, size_t len) {
+        if (idx < 0) idx = 0;
+        if (idx >= len - 1) idx = len - 2;
+        size_t i = static_cast<size_t>(idx);
+        double f = idx - i;
+        return s[i] * (1.0 - f) + s[i + 1] * f;
+    }
     
     // Estimate carrier offset from spectrum (coarse AFC)
     double estimate_offset(const sample_t* samples, size_t num_samples) {
-        // Try a range of offsets and find the one with best total tone energy
         double best_offset = 0;
         double best_energy = 0;
         
@@ -140,7 +155,6 @@ public:
                     phase_f2 += phase_inc_f2;
                 }
                 
-                // Sum of both tone energies (MSK uses one or the other per symbol)
                 total_energy += std::norm(corr_f1) + std::norm(corr_f2);
             }
             
@@ -150,7 +164,7 @@ public:
             }
         }
         
-        // Fine tune with smaller steps
+        // Fine tune
         double fine_best = best_offset;
         for (double offset = best_offset - 30; offset <= best_offset + 30; offset += 5) {
             double phase_f1 = 0, phase_f2 = 0;
@@ -196,22 +210,50 @@ public:
         double phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
         double phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
         
-        for (size_t sym = 0; sym < num_samples / SAMPLES_PER_SYMBOL; ++sym) {
-            std::complex<double> corr_f1(0, 0), corr_f2(0, 0);
+        // Early-late spacing: T/4 = 10 samples
+        const double EL_OFFSET = SAMPLES_PER_SYMBOL / 4.0;
+        
+        // Current sample position (fractional)
+        double pos = mu_;
+        
+        // Process symbols while we have enough samples
+        // Need: pos + SPS + EL_OFFSET < num_samples
+        while (pos + SAMPLES_PER_SYMBOL + EL_OFFSET < num_samples) {
             
-            // Integrate over symbol
+            std::complex<double> corr_f1(0, 0), corr_f2(0, 0);
+            std::complex<double> corr_f1_e(0, 0), corr_f2_e(0, 0);  // Early
+            std::complex<double> corr_f1_l(0, 0), corr_f2_l(0, 0);  // Late
+            
+            // Save phase at symbol start for this integration
+            double ph1 = phase_f1_, ph2 = phase_f2_;
+            
+            // Integrate over symbol period
             for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
-                size_t idx = sym * SAMPLES_PER_SYMBOL + i;
+                double p_on = pos + i;
+                double p_early = p_on - EL_OFFSET;
+                double p_late = p_on + EL_OFFSET;
                 
-                std::complex<double> lo_f1(std::cos(phase_f1_), std::sin(phase_f1_));
-                std::complex<double> lo_f2(std::cos(phase_f2_), std::sin(phase_f2_));
+                sample_t s_on = interp(samples, p_on, num_samples);
+                sample_t s_e = (p_early >= 0) ? interp(samples, p_early, num_samples) : samples[0];
+                sample_t s_l = interp(samples, p_late, num_samples);
                 
-                corr_f1 += samples[idx] * std::conj(lo_f1);
-                corr_f2 += samples[idx] * std::conj(lo_f2);
+                std::complex<double> lo1(std::cos(ph1), std::sin(ph1));
+                std::complex<double> lo2(std::cos(ph2), std::sin(ph2));
                 
-                phase_f1_ += phase_inc_f1;
-                phase_f2_ += phase_inc_f2;
+                corr_f1 += s_on * std::conj(lo1);
+                corr_f2 += s_on * std::conj(lo2);
+                corr_f1_e += s_e * std::conj(lo1);
+                corr_f2_e += s_e * std::conj(lo2);
+                corr_f1_l += s_l * std::conj(lo1);
+                corr_f2_l += s_l * std::conj(lo2);
+                
+                ph1 += phase_inc_f1;
+                ph2 += phase_inc_f2;
             }
+            
+            // Update persistent phases
+            phase_f1_ = ph1;
+            phase_f2_ = ph2;
             
             // Wrap phases
             while (phase_f1_ > PI) phase_f1_ -= TWO_PI;
@@ -219,53 +261,90 @@ public:
             while (phase_f2_ > PI) phase_f2_ -= TWO_PI;
             while (phase_f2_ < -PI) phase_f2_ += TWO_PI;
             
-            double f1_energy = std::norm(corr_f1);
-            double f2_energy = std::norm(corr_f2);
+            double e1 = std::norm(corr_f1);
+            double e2 = std::norm(corr_f2);
             
-            // Soft decision: positive = F2 (bit 0), negative = F1 (bit 1)
-            soft_out.push_back(f2_energy - f1_energy);
+            // Soft decision
+            soft_out.push_back(e2 - e1);
             
-            // AFC: estimate frequency error from phase rotation of dominant tone
-            if (sym > 0) {
-                std::complex<double> dominant_corr, prev_dominant;
-                if (f1_energy > f2_energy) {
-                    dominant_corr = corr_f1;
-                    prev_dominant = prev_corr_f1_;
+            // === Timing Error Detector (Early-Late Gate) ===
+            double ted;
+            if (e1 > e2) {
+                double ee = std::norm(corr_f1_e);
+                double el = std::norm(corr_f1_l);
+                ted = (el - ee) / (el + ee + 1e-10);
+            } else {
+                double ee = std::norm(corr_f2_e);
+                double el = std::norm(corr_f2_l);
+                ted = (el - ee) / (el + ee + 1e-10);
+            }
+            
+            // 2nd order loop filter
+            timing_freq_ += beta_timing_ * ted;
+            timing_freq_ = std::clamp(timing_freq_, -0.1, 0.1);  // Max 10% rate error
+            double timing_adj = alpha_timing_ * ted + timing_freq_;
+            timing_adj = std::clamp(timing_adj, -2.0, 2.0);  // Max 2 samples per symbol
+            
+            // === AFC ===
+            if (soft_out.size() > 1) {
+                std::complex<double> dom, prev_dom;
+                if (e1 > e2) {
+                    dom = corr_f1;
+                    prev_dom = prev_corr_f1_;
                 } else {
-                    dominant_corr = corr_f2;
-                    prev_dominant = prev_corr_f2_;
+                    dom = corr_f2;
+                    prev_dom = prev_corr_f2_;
                 }
                 
-                // Phase difference between symbols indicates frequency error
-                double phase_diff = std::arg(dominant_corr * std::conj(prev_dominant));
+                double pd = std::arg(dom * std::conj(prev_dom));
+                double ferr = pd * SYMBOL_RATE / TWO_PI;
                 
-                // Convert to frequency: phase_diff per symbol period
-                double freq_err = phase_diff * SYMBOL_RATE / TWO_PI;
-                
-                // Update frequency estimate (low-pass filter)
-                freq_offset_ += afc_alpha_ * freq_err;
-                
-                // Limit AFC range
+                freq_offset_ += afc_alpha_ * ferr;
                 freq_offset_ = std::clamp(freq_offset_, -2000.0, 2000.0);
                 
-                // Update phase increments with new estimate
                 phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
                 phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
             }
             
             prev_corr_f1_ = corr_f1;
             prev_corr_f2_ = corr_f2;
+            
+            // Advance to next symbol with timing adjustment
+            pos += SAMPLES_PER_SYMBOL + timing_adj;
         }
+        
+        // Save fractional remainder for next chunk
+        // mu_ = how far into the next symbol period we are
+        size_t samples_used = static_cast<size_t>(pos);
+        mu_ = pos - samples_used;
+        
+        // We need to remember how many samples to skip at the start of next chunk
+        // This is stored implicitly: next call should start at sample 0, but
+        // we need to account for the fact that we stopped mid-stream.
+        // Actually, for streaming, we need to handle this differently...
+        
+        // For streaming: we consumed 'pos' samples worth, next chunk starts fresh
+        // but mu_ tells us our timing phase within a symbol
+        leftover_samples_ = num_samples - samples_used;
     }
     
     double get_freq_offset() const { return freq_offset_; }
+    double get_timing_freq() const { return timing_freq_; }
     void set_afc_bandwidth(double alpha) { afc_alpha_ = alpha; }
+    size_t get_leftover() const { return leftover_samples_; }
 
 private:
     double freq_offset_;
     double phase_f1_, phase_f2_;
     std::complex<double> prev_corr_f1_, prev_corr_f2_;
     double afc_alpha_;
+    
+    // Timing recovery
+    double mu_;              // Fractional timing offset (0 to 1 symbol)
+    double timing_freq_;     // Timing frequency offset estimate
+    double alpha_timing_;    // Loop proportional gain
+    double beta_timing_;     // Loop integral gain
+    size_t leftover_samples_ = 0;
 };
 
 //------------------------------------------------------------------------------
@@ -702,7 +781,7 @@ private:
     
     // Thresholds
     static constexpr double SOFT_SYNC_HUNTING_THRESHOLD = 0.85;
-    static constexpr double SOFT_SYNC_LOCKED_THRESHOLD = 0.40;
+    static constexpr double SOFT_SYNC_LOCKED_THRESHOLD = 0.70;  // Was 0.40, raised to reject noise
     static constexpr double RAW_SYNC_HUNTING_THRESHOLD = 5000.0;
     static constexpr double MIN_SYNC_ENERGY = 100.0;
 };
@@ -981,13 +1060,21 @@ int main(int argc, char* argv[]) {
                 }
                 
                 total_symbols += soft.size();
-                chunk_buf.clear();
+                
+                // Keep leftover samples for next chunk (for timing recovery continuity)
+                size_t leftover = demod.get_leftover();
+                if (leftover > 0 && leftover < chunk_buf.size()) {
+                    std::vector<sample_t> keep(chunk_buf.end() - leftover, chunk_buf.end());
+                    chunk_buf = std::move(keep);
+                } else {
+                    chunk_buf.clear();
+                }
                 
                 // Periodic status update
                 if (!quiet && (total_samples % (size_t)(SAMPLE_RATE * 5) < CHUNK_SAMPLES)) {
-                    fprintf(stderr, "[%.1fs] %zu symbols, %d frames (%d perfect), AFC: %.1f Hz\n",
+                    fprintf(stderr, "[%.1fs] %zu symbols, %d frames (%d perfect), AFC: %.1f Hz, TFreq: %.4f\n",
                             total_samples / SAMPLE_RATE, total_symbols, decoded, perfect,
-                            demod.get_freq_offset());
+                            demod.get_freq_offset(), demod.get_timing_freq());
                 }
             }
         }
