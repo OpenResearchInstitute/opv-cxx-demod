@@ -973,6 +973,11 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // Set up frame-sized stdout buffer for efficient raw output
+    // This ensures each frame is written with a single syscall
+    static char stdout_buffer[FRAME_BYTES];
+    std::setvbuf(stdout, stdout_buffer, _IOFBF, FRAME_BYTES);
+    
     if (!quiet) {
         fprintf(stderr, "╔═══════════════════════════════════════════════════════════════════╗\n");
         if (coherent)
@@ -1051,10 +1056,10 @@ int main(int argc, char* argv[]) {
                             if (!quiet)
                                 print_frame(decoded, frame, metric, res.sync_quality);
                             
-                            if (raw)
+                            if (raw) {
                                 std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
-                            
-                            std::cout.flush();  // Flush immediately in streaming mode
+                                std::cout.flush();
+                            }
                         }
                     }
                 }
@@ -1098,8 +1103,10 @@ int main(int argc, char* argv[]) {
                         if (!quiet)
                             print_frame(decoded, frame, metric, res.sync_quality);
                         
-                        if (raw)
+                        if (raw) {
                             std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
+                            std::cout.flush();
+                        }
                     }
                 }
             }
@@ -1190,8 +1197,10 @@ int main(int argc, char* argv[]) {
                 if (!quiet)
                     print_frame(decoded, frame, metric, res.sync_quality);
                 
-                if (raw)
+                if (raw) {
                     std::cout.write(reinterpret_cast<char*>(frame.data()), FRAME_BYTES);
+                    std::cout.flush();
+                }
             }
         }
     }

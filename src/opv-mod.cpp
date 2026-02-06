@@ -1,10 +1,11 @@
 /**
- * opv-mod-hdl-fixed.cpp - OPV transmitter matching HDL modulator exactly
+ * opv-mod.cpp - OPV MSK Modulator
  * 
- * FIXES from original:
- * 1. Convolutional encoder masks: 0x4F/0x6D (not 0x79/0x5B)
- * 2. Base-40 callsign encoding (not ASCII)
- * 3. Proper OPV header format
+ * Modes:
+ *   -B N        BERT mode: generate N test frames internally
+ *   -R          Raw mode: read 134-byte frames from stdin
+ * 
+ * Matches HDL modulator implementation exactly.
  * 
  * Copyright 2026 Open Research Institute, Inc.
  * SPDX-License-Identifier: CERN-OHL-S-2.0
@@ -18,6 +19,7 @@
 #include <array>
 #include <string>
 #include <getopt.h>
+#include <unistd.h>
 
 // =============================================================================
 // PARAMETERS
@@ -112,7 +114,7 @@ private:
 
 // =============================================================================
 // CONVOLUTIONAL ENCODER (K=7, Rate 1/2)
-// FIXED: Uses correct polynomial masks matching HDL's bit indexing
+// Uses correct polynomial masks matching HDL's bit indexing
 // =============================================================================
 
 class ConvEncoder {
@@ -121,9 +123,9 @@ public:
     
     void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
         uint8_t state = (in << 6) | sr;
-        // FIXED: HDL uses 6-i indexing, so:
-        // G1 = 171 octal = 1111001 -> mask = 0x4F (not 0x79!)
-        // G2 = 133 octal = 1011011 -> mask = 0x6D (not 0x5B!)
+        // HDL uses 6-i indexing, so:
+        // G1 = 171 octal = 1111001 -> mask = 0x4F
+        // G2 = 133 octal = 1011011 -> mask = 0x6D
         g1 = __builtin_parity(state & 0x4F);
         g2 = __builtin_parity(state & 0x6D);
         sr = ((sr << 1) | in) & 0x3F;
@@ -333,8 +335,8 @@ void send_encoded_frame(const encoded_bits_t& encoded) {
     }
 }
 
-// Build OPV frame with proper Base-40 callsign encoding
-frame_t build_opv_frame(const std::string& callsign, uint32_t token, uint32_t frame_num) {
+// Build OPV frame with proper Base-40 callsign encoding (BERT mode)
+frame_t build_bert_frame(const std::string& callsign, uint32_t token, uint32_t frame_num) {
     frame_t frame = {};
     
     // Station ID: 6 bytes Base-40 encoded
@@ -358,19 +360,54 @@ frame_t build_opv_frame(const std::string& callsign, uint32_t token, uint32_t fr
     return frame;
 }
 
+// Read a 134-byte frame from stdin (Raw mode)
+// Returns true if frame read successfully, false on EOF or error
+bool read_frame_from_stdin(frame_t& frame) {
+    size_t bytes_read = 0;
+    
+    while (bytes_read < FRAME_BYTES) {
+        ssize_t n = read(STDIN_FILENO, frame.data() + bytes_read, FRAME_BYTES - bytes_read);
+        if (n <= 0) {
+            if (n == 0 && bytes_read == 0) {
+                // Clean EOF at frame boundary
+                return false;
+            }
+            if (n == 0) {
+                std::cerr << "Warning: EOF after partial frame (" << bytes_read << " bytes)\n";
+                return false;
+            }
+            // Read error
+            std::cerr << "Error reading from stdin\n";
+            return false;
+        }
+        bytes_read += n;
+    }
+    
+    return true;
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================
 
 void usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " -S CALLSIGN -B FRAMES [-t TOKEN] [-r] [-c] [-v]\n\n";
+    std::cerr << "Usage: " << prog << " [OPTIONS]\n\n";
+    std::cerr << "Modes (mutually exclusive):\n";
+    std::cerr << "  -B FRAMES     BERT mode: generate N test frames\n";
+    std::cerr << "  -R            Raw mode: read 134-byte frames from stdin\n";
+    std::cerr << "\n";
     std::cerr << "Options:\n";
-    std::cerr << "  -S CALLSIGN   Station callsign (e.g., W5NYV, UM5BK)\n";
-    std::cerr << "  -B FRAMES     Number of BERT frames to transmit\n";
+    std::cerr << "  -S CALLSIGN   Station callsign (required for BERT mode)\n";
     std::cerr << "  -t TOKEN      24-bit token (default: 0xBBAADD)\n";
-    std::cerr << "  -r            Reset modulator per frame\n";
-    std::cerr << "  -c            Continuous mode (loop forever)\n";
-    std::cerr << "  -v            Verbose output\n";
+    std::cerr << "  -c            Continuous mode (loop BERT forever)\n";
+    std::cerr << "  -v            Verbose output to stderr\n";
+    std::cerr << "\n";
+    std::cerr << "Output: 16-bit I/Q samples (little-endian, interleaved) to stdout\n";
+    std::cerr << "\n";
+    std::cerr << "Examples:\n";
+    std::cerr << "  " << prog << " -S W5NYV -B 10              # 10 BERT frames\n";
+    std::cerr << "  " << prog << " -R < frames.bin             # Modulate pre-built frames\n";
+    std::cerr << "  cat frames.bin | " << prog << " -R         # Same, via pipe\n";
     exit(1);
 }
 
@@ -378,64 +415,116 @@ int main(int argc, char* argv[]) {
     std::string callsign;
     int bert_frames = 0;
     bool continuous = false;
+    bool raw_mode = false;
     uint32_t token = 0xBBAADD;  // Default token
     
     int opt;
-    while ((opt = getopt(argc, argv, "S:B:t:rcvh")) != -1) {
+    while ((opt = getopt(argc, argv, "S:B:t:Rcvh")) != -1) {
         switch (opt) {
             case 'S': callsign = optarg; break;
             case 'B': bert_frames = std::atoi(optarg); break;
             case 't': token = std::strtoul(optarg, nullptr, 0); break;
-            case 'r': g_reset_per_frame = true; break;
+            case 'R': raw_mode = true; break;
             case 'c': continuous = true; break;
             case 'v': g_verbose = true; break;
             default: usage(argv[0]);
         }
     }
     
-    if (callsign.empty() || bert_frames <= 0) {
+    // Validate mode selection
+    if (raw_mode && bert_frames > 0) {
+        std::cerr << "Error: -R and -B are mutually exclusive\n";
+        usage(argv[0]);
+    }
+    
+    if (!raw_mode && bert_frames <= 0) {
+        std::cerr << "Error: Must specify either -R (raw mode) or -B N (BERT mode)\n";
+        usage(argv[0]);
+    }
+    
+    if (!raw_mode && callsign.empty()) {
+        std::cerr << "Error: BERT mode requires -S CALLSIGN\n";
         usage(argv[0]);
     }
     
     // Validate callsign length (max ~9 chars for 48-bit Base-40)
-    if (callsign.length() > 9) {
+    if (!callsign.empty() && callsign.length() > 9) {
         std::cerr << "Warning: Callsign truncated to 9 characters for Base-40 encoding\n";
         callsign = callsign.substr(0, 9);
     }
     
     if (g_verbose) {
-        std::cerr << "OPV Transmitter (HDL-accurate, FIXED)\n";
-        std::cerr << "  Callsign: " << callsign << "\n";
-        std::cerr << "  Token:    0x" << std::hex << token << std::dec << "\n";
-        std::cerr << "  BERT frames: " << bert_frames << "\n";
-        std::cerr << "  Conv encoder masks: G1=0x4F, G2=0x6D\n";
+        std::cerr << "OPV Modulator\n";
+        if (raw_mode) {
+            std::cerr << "  Mode: Raw (reading 134-byte frames from stdin)\n";
+        } else {
+            std::cerr << "  Mode: BERT\n";
+            std::cerr << "  Callsign: " << callsign << "\n";
+            std::cerr << "  Token:    0x" << std::hex << token << std::dec << "\n";
+            std::cerr << "  Frames:   " << bert_frames << "\n";
+        }
+        std::cerr << "  Conv encoder: G1=0x4F, G2=0x6D\n";
         std::cerr << "\n";
     }
     
-    uint32_t frame_num = 0;
-    
-    do {
+    // =========================================================================
+    // RAW MODE: Read frames from stdin
+    // =========================================================================
+    if (raw_mode) {
         g_mod.reset();
         
-        for (int f = 0; f < bert_frames; ++f) {
+        frame_t frame;
+        uint64_t frame_count = 0;
+        
+        while (read_frame_from_stdin(frame)) {
             if (g_reset_per_frame) {
                 g_mod.reset();
             }
             
-            frame_t frame = build_opv_frame(callsign, token, frame_num++);
             encoded_bits_t encoded = encode_frame(frame);
-            
             send_sync_word();
             send_encoded_frame(encoded);
             
-            if (g_verbose && ((f + 1) % 10 == 0 || f == bert_frames - 1)) {
-                std::cerr << "Sent frame " << (f + 1) << "/" << bert_frames << "\n";
+            frame_count++;
+            
+            if (g_verbose && (frame_count % 100 == 0)) {
+                std::cerr << "Sent " << frame_count << " frames\n";
             }
         }
         
-    } while (continuous);
+        if (g_verbose) {
+            std::cerr << "End of input. Total frames: " << frame_count << "\n";
+        }
+    }
+    // =========================================================================
+    // BERT MODE: Generate test frames
+    // =========================================================================
+    else {
+        uint32_t frame_num = 0;
+        
+        do {
+            g_mod.reset();
+            
+            for (int f = 0; f < bert_frames; ++f) {
+                if (g_reset_per_frame) {
+                    g_mod.reset();
+                }
+                
+                frame_t frame = build_bert_frame(callsign, token, frame_num++);
+                encoded_bits_t encoded = encode_frame(frame);
+                
+                send_sync_word();
+                send_encoded_frame(encoded);
+                
+                if (g_verbose && ((f + 1) % 10 == 0 || f == bert_frames - 1)) {
+                    std::cerr << "Sent frame " << (f + 1) << "/" << bert_frames << "\n";
+                }
+            }
+            
+        } while (continuous);
+    }
     
-    // Trailing zeros
+    // Trailing zeros to flush
     std::array<IQSample, SAMPLES_PER_SYMBOL> zeros = {};
     for (int i = 0; i < 100; ++i) output(zeros);
     
