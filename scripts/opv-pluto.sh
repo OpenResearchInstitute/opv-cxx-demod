@@ -19,6 +19,17 @@ set -e
 # CONFIGURATION
 # =============================================================================
 
+# Find script directory and repo root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# If script is in repo root, use current directory
+if [[ -d "$SCRIPT_DIR/bin" ]]; then
+    REPO_ROOT="$SCRIPT_DIR"
+elif [[ -d "$SCRIPT_DIR/../bin" ]]; then
+    REPO_ROOT="$SCRIPT_DIR/.."
+fi
+
 PLUTO_URI="ip:192.168.2.1"
 TX_FREQ=435000000
 RX_FREQ=435000000
@@ -30,7 +41,7 @@ TX_PORT=57372                        # Listen for frames from Interlocutor
 RX_PORT=57373                        # Send decoded frames to Interlocutor
 VERBOSE=0
 
-OPV_MODEM="bin/opv-modem"
+OPV_MODEM="$REPO_ROOT/bin/opv-modem"
 
 # PIDs for cleanup
 TX_PID=""
@@ -141,15 +152,16 @@ done
 # =============================================================================
 
 if [[ ! -x "$OPV_MODEM" ]]; then
-    if [[ -x "./bin/opv-modem" ]]; then
-        OPV_MODEM="./bin/opv-modem"
-    elif [[ -x "../bin/opv-modem" ]]; then
-        OPV_MODEM="../bin/opv-modem"
-    else
-        echo "Error: Cannot find opv-modem executable"
-        echo "Build with: make"
-        exit 1
-    fi
+    echo "Error: Cannot find opv-modem at $OPV_MODEM"
+    echo "Build with: cd $REPO_ROOT && make"
+    exit 1
+fi
+
+OPV_DEMOD="$REPO_ROOT/bin/opv-demod"
+if [[ ! -x "$OPV_DEMOD" ]]; then
+    echo "Error: Cannot find opv-demod at $OPV_DEMOD"
+    echo "Build with: cd $REPO_ROOT && make"
+    exit 1
 fi
 
 if ! command -v iio_attr &> /dev/null; then
@@ -215,6 +227,11 @@ echo "╔═══════════════════════�
 echo "║              OPV PlutoSDR Transceiver                             ║"
 echo "╚═══════════════════════════════════════════════════════════════════╝"
 echo ""
+
+if [[ $VERBOSE -eq 1 ]]; then
+    echo "  Binaries:   $REPO_ROOT/bin/"
+fi
+
 echo "Connecting to PlutoSDR at $PLUTO_URI..."
 
 if ! iio_info -u "$PLUTO_URI" &> /dev/null; then
@@ -289,7 +306,7 @@ TX_PID=$!
 # =============================================================================
 
 # Start RX pipeline: iio_readdev | opv-modem -R
-MODEM_RX_OPTS="-R -r $RX_PORT"
+MODEM_RX_OPTS="-R -r $RX_PORT -d $OPV_DEMOD"
 [[ $VERBOSE -eq 1 ]] && MODEM_RX_OPTS="$MODEM_RX_OPTS -v"
 
 $IIO_READ_CMD -u "$PLUTO_URI" -b "$BUFFER_SIZE" cf-ad9361-lpc | $OPV_MODEM $MODEM_RX_OPTS 2>&1 &
