@@ -71,6 +71,17 @@ Full-duplex transceiver for use with Interlocutor. One script, just like Dialogu
 2. Start Interlocutor (TX to UDP 57372, listen on UDP 57373)
 3. Use Interlocutor to send messages and make calls
 
+**Port Configuration Note:**
+
+Dialogus (running on the Pluto itself) uses port 57372 for both directions because Interlocutor and Dialogus are on different IP addresses. When running opv-modem on the same computer as Interlocutor, we need separate ports to avoid conflicts:
+
+| Direction | Port | Description |
+|-----------|------|-------------|
+| Interlocutor → opv-modem | 57372 | Frames to transmit |
+| opv-modem → Interlocutor | 57373 | Received frames |
+
+Configure Interlocutor with: TX port = 57372, RX port = 57373
+
 **Options:**
 | Option | Description |
 |--------|-------------|
