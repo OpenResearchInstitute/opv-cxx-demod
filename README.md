@@ -2,7 +2,7 @@
 
 **Opulent Voice Protocol** - A digital voice protocol for amateur radio.
 
-Self-contained C++ implementations of the OPV modulator and demodulator, designed for use with PlutoSDR/LibreSDR hardware.
+Self-contained C++ implementations of the OPV modulator and demodulator, designed for use with PlutoSDR/LibreSDR hardware and Interlocutor.
 
 ## Quick Start
 
@@ -13,11 +13,8 @@ make
 # Loopback test
 make test
 
-# Receive from PlutoSDR (run from repo root)
-scripts/opv-pluto-rx.sh
-
-# Transmit to PlutoSDR (run from repo root)
-scripts/opv-pluto-tx.sh -S W5NYV -B 10
+# Full transceiver with Interlocutor
+./opv-pluto.sh -f 435000000 -v
 ```
 
 ## Signal Parameters
@@ -57,6 +54,56 @@ scripts/opv-pluto-tx.sh -S W5NYV -B 10
 
 ## Programs
 
+### opv-pluto.sh - PlutoSDR Transceiver
+
+Full-duplex transceiver for use with Interlocutor. One script, just like Dialogus.
+
+```bash
+./opv-pluto.sh                              # 435 MHz simplex (default)
+./opv-pluto.sh -f 905050000                 # 905.05 MHz
+./opv-pluto.sh -f 144390000 -v              # 2m band, verbose
+./opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
+./opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
+```
+
+**Workflow:**
+1. Start `./opv-pluto.sh`
+2. Start Interlocutor (TX to UDP 57372, listen on UDP 57373)
+3. Use Interlocutor to send messages and make calls
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-f, --frequency` | Simplex frequency in Hz |
+| `--tx-freq` | TX frequency (split operation) |
+| `--rx-freq` | RX frequency (split operation) |
+| `--tx-gain` | TX gain in dB (default: -20) |
+| `--rx-gain` | RX gain in dB (default: 40) |
+| `--tx-port` | UDP port from Interlocutor (default: 57372) |
+| `--rx-port` | UDP port to Interlocutor (default: 57373) |
+| `-u, --uri` | PlutoSDR URI (default: ip:192.168.2.1) |
+| `-v` | Verbose output |
+
+### opv-modem - Modem Server
+
+UDP server for Interlocutor integration. Used internally by opv-pluto.sh.
+
+```
+Usage: bin/opv-modem [OPTIONS]
+
+Modes:
+  -l          Loopback: UDP → mod → demod → UDP (testing)
+  -t          TX mode: UDP → mod → stdout (to PlutoSDR)
+  -R          RX mode: stdin → demod → UDP (from PlutoSDR)
+
+Options:
+  -p PORT     UDP port to listen on (default: 57372)
+  -r PORT     UDP port to send to (default: 57373)
+  -c CALL     Rewrite callsign (loopback repeater mode)
+  -d PATH     Path to opv-demod (default: ./bin/opv-demod)
+  -v          Verbose output
+```
+
 ### opv-mod - Modulator
 
 ```
@@ -65,6 +112,7 @@ Usage: bin/opv-mod -S CALLSIGN -B FRAMES [-t TOKEN] [-c] [-v]
 Options:
   -S CALLSIGN   Station callsign (e.g., W5NYV, KB5MU)
   -B FRAMES     Number of frames to transmit
+  -R            Raw mode (read 134-byte frames from stdin)
   -t TOKEN      24-bit token (default: 0xBBAADD)
   -c            Continuous mode (loop forever)
   -v            Verbose output
@@ -75,10 +123,11 @@ Output: 16-bit I/Q samples (little-endian) to stdout
 ### opv-demod - Demodulator
 
 ```
-Usage: bin/opv-demod [-s] < input.iq
+Usage: bin/opv-demod [-s] [-r] < input.iq
 
 Options:
   -s            Streaming mode (real-time from radio)
+  -r            Raw output (134-byte frames to stdout)
 
 Input: 16-bit I/Q samples (little-endian) from stdin
 
@@ -89,9 +138,9 @@ Features:
   - Sync tracking with flywheel
 ```
 
-## PlutoSDR Scripts
+## Standalone PlutoSDR Scripts
 
-Run these from the repository root directory.
+For use without Interlocutor (BERT testing, debugging).
 
 ### Receive: opv-pluto-rx.sh
 
@@ -116,28 +165,32 @@ Requires `iio_attr` and `iio_rwdev` (libiio-utils).
 
 ```
 opv-cxx-demod/
-├── Makefile           # Build system
-├── README.md          # This file
-├── LICENSE            # CERN-OHL-S-2.0
-├── bin/               # Built binaries (created by make)
+├── Makefile              # Build system
+├── README.md             # This file
+├── LICENSE               # CERN-OHL-S-2.0
+├── opv-pluto.sh          # Full transceiver script
+├── bin/                  # Built binaries (created by make)
 │   ├── opv-mod
-│   └── opv-demod
+│   ├── opv-demod
+│   └── opv-modem
 ├── src/
-│   ├── opv-mod.cpp    # Modulator (self-contained)
-│   └── opv-demod.cpp  # Demodulator (self-contained)
+│   ├── opv-mod.cpp       # Modulator (self-contained)
+│   ├── opv-demod.cpp     # Demodulator (self-contained)
+│   └── opv-modem.cpp     # Modem server (self-contained)
 ├── scripts/
-│   ├── opv-pluto-rx.sh
-│   └── opv-pluto-tx.sh
+│   ├── opv-pluto-rx.sh   # Standalone RX script
+│   └── opv-pluto-tx.sh   # Standalone TX script
 └── docs/
-    ├── numerology.ipynb    # Design calculations
-    └── filter-taps.ipynb   # Filter design
+    ├── numerology.ipynb  # Design calculations
+    └── filter-taps.ipynb # Filter design
 ```
 
 ## Interoperability
 
-- **Loopback** Successfully modulates and demodulates to itself
-- **Demodulates** LibreSDR HDL modum Locutus transmissions
-- **Modulation** To Be Tested with LibreSDR HDL modem Locutus receiving
+- **Interlocutor**: Full integration via UDP (text messages, voice calls)
+- **Loopback**: Successfully modulates and demodulates to itself
+- **Demodulates**: LibreSDR HDL modem Locutus transmissions
+- **Modulation**: To Be Tested with LibreSDR HDL modem Locutus receiving
 - **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
 
 ## Building
@@ -145,11 +198,14 @@ opv-cxx-demod/
 Requirements:
 - C++17 compiler (g++ or clang++)
 - No external dependencies (self-contained)
+- libiio-utils for PlutoSDR scripts
 
 ```bash
-make        # Build both programs
-make test   # Verify loopback works
-make clean  # Remove binaries
+make            # Build all programs
+make test       # Verify loopback works
+make test-raw   # Test raw frame mode
+make test-rx    # Test RX mode UDP output
+make clean      # Remove binaries
 ```
 
 ## License
@@ -162,6 +218,7 @@ Open Research Institute, Inc.
 https://openresearch.institute
 
 Developed as part of the Phase 4 Ground project for amateur radio digital communications.
+
 ## Thanks
 
 Thanks to [Rob Riggs of Mobilinkd LLC](https://github.com/mobilinkd) for the M17 implementation that originally inspired this codebase.
