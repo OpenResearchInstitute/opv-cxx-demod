@@ -1186,10 +1186,20 @@ int main(int argc, char* argv[]) {
                 modulate_and_output(frame, modulator, iq_ctx);
                 session.real_frame_sent(frame);
                 
-                // Advance the deadline for the next frame slot.
-                // If we were hanging and just got a real frame, we take over
-                // the current slot and schedule the next one.
-                session.next_deadline_us = get_time_us() + FRAME_PERIOD_US;
+                // Advance deadline on a fixed grid aligned to the session start.
+                // Using advance_deadline() (+=40ms) instead of get_time_us()+40ms
+                // keeps the modem's frame clock locked to the same cadence as
+                // Interlocutor's audio hardware callback. Wall-clock-relative
+                // deadlines drift by the modulation time each frame.
+                // If we've fallen behind (e.g., burst after long preamble),
+                // snap forward to avoid a cascade of expired deadlines.
+                session.advance_deadline();
+                {
+                    int64_t now_after = get_time_us();
+                    while (session.next_deadline_us <= now_after) {
+                        session.advance_deadline();
+                    }
+                }
             }
         }
         
