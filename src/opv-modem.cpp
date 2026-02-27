@@ -6,8 +6,15 @@
  * frames back to Interlocutor.
  * 
  * Key features:
+ *   - Transmission session management (preamble, dummy frames, postamble)
  *   - Persistent demodulator subprocess (maintains lock across frames)
  *   - Optional callsign rewrite for loopback repeater testing
+ * 
+ * Session management matches Dialogus behavior:
+ *   - Preamble (40ms, 0xCC pattern) before first frame of each session
+ *   - Dummy frames (all-zero payload) to fill gaps and keep carrier alive
+ *   - Postamble (Barker-11 pattern) after hang timer expires
+ *   - Clean session start/end with continuous IQ output throughout
  * 
  * Usage:
  *   opv-modem [OPTIONS]
@@ -19,6 +26,7 @@
  *   -c CALL     Rewrite station ID on returned frames (loopback repeater)
  *   -d PATH     Path to opv-demod binary (default: ./bin/opv-demod)
  *   -o FILE     Also save IQ samples to file
+ *   -n FRAMES   Hang timer frames before postamble (default: 25)
  *   -v          Verbose output
  *   -q          Quiet mode
  * 
@@ -53,6 +61,7 @@
 #include <sys/select.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
 
 // Networking
 #include <sys/socket.h>
@@ -83,6 +92,13 @@ constexpr double F2_FREQ = +FREQ_DEV;
 
 constexpr uint8_t G1_MASK = 0x4F;
 constexpr uint8_t G2_MASK = 0x6D;
+
+// Session management (matches Dialogus behavior)
+constexpr size_t OVP_HEADER_SIZE = 12;        // station ID(6) + token(3) + reserved(3)
+constexpr size_t OVP_PAYLOAD_SIZE = 122;      // payload portion of OV frame
+constexpr int    HANG_TIMER_FRAMES_DEFAULT = 25; // dummy frames before postamble (1000ms)
+constexpr int    FRAME_PERIOD_US = 40000;     // 40ms per frame
+constexpr int    IDLE_POLL_TIMEOUT_MS = 100;  // poll timeout when idle
 
 // =============================================================================
 // TYPES
@@ -343,6 +359,182 @@ void modulate_frame(const frame_t& frame, HDLModulator& mod, std::vector<IQSampl
 }
 
 // =============================================================================
+// WALL-CLOCK TIMING
+// =============================================================================
+
+// Forward declaration for IQOutputContext
+class PersistentDemodulator;
+
+static int64_t get_time_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+// =============================================================================
+// PREAMBLE GENERATION
+// =============================================================================
+//
+// The preamble is a raw 1100 repeating pattern (0xCC) fed directly to the
+// modulator for one full frame period (40ms). No sync word, no FEC, no
+// randomization. This gives the receiving demodulator a clean signal to
+// acquire frequency, phase, and symbol timing before the first real frame.
+// Matches Dialogus start_transmission_session() behavior.
+
+void emit_preamble(HDLModulator& mod, std::vector<IQSample>& iq_out) {
+    static const uint8_t pattern[] = {1, 1, 0, 0};
+    std::array<IQSample, SAMPLES_PER_SYMBOL> sym_samples;
+    for (size_t i = 0; i < FRAME_SYMBOLS; ++i) {
+        mod.modulate_bit(pattern[i % 4], sym_samples);
+        for (const auto& s : sym_samples) iq_out.push_back(s);
+    }
+}
+
+// =============================================================================
+// DUMMY FRAME GENERATION
+// =============================================================================
+//
+// A dummy frame preserves the last real frame's header (station ID, token,
+// reserved fields) but replaces the payload with all zeros. This goes through
+// the normal encode pipeline (randomize → FEC → interleave → sync word) so
+// the receiver sees a valid frame. The all-zero payload acts as a COBS
+// delimiter on the receive side — it terminates any in-progress reassembly
+// and produces zero-length packets that are silently dropped.
+//
+// The purpose is to keep the RF carrier alive during pauses, maintaining
+// the demodulator's tracking loops. Matches Dialogus create_dummy_frame().
+
+frame_t make_dummy_frame(const frame_t& last_real) {
+    frame_t dummy = last_real;
+    std::fill(dummy.begin() + OVP_HEADER_SIZE, dummy.end(), 0x00);
+    return dummy;
+}
+
+// =============================================================================
+// POSTAMBLE FRAME GENERATION
+// =============================================================================
+//
+// The postamble signals the end of a transmission session. Its payload is
+// filled with a repeating 11-bit Barker code (11100010010), which is a
+// distinctive pattern the receiver can use to identify end-of-transmission.
+// The last byte is forced to 0x00 as a COBS delimiter, flushing any partial
+// packet data from the receiver's reassembly buffer.
+//
+// Like dummy frames, the postamble preserves the last real frame's header
+// and goes through the normal encode pipeline.
+// Matches Dialogus create_postamble_frame() / create_postamble_logical_frame().
+
+// Precomputed from Dialogus: Barker-11 (11100010010) packed into bytes,
+// repeating across the 11-byte period. See dialogus.c line 321-325.
+static const uint8_t barker_11_pattern[] = {
+    0xE2, 0x5C, 0x4B, 0x89, 0x71, 0x2E,
+    0x25, 0xC4, 0xB8, 0x97, 0x12
+};
+
+frame_t make_postamble_frame(const frame_t& last_real) {
+    frame_t post = last_real;
+    for (size_t i = OVP_HEADER_SIZE; i < FRAME_BYTES - 1; ++i) {
+        post[i] = barker_11_pattern[(i - OVP_HEADER_SIZE) % sizeof(barker_11_pattern)];
+    }
+    post[FRAME_BYTES - 1] = 0x00;  // COBS delimiter
+    return post;
+}
+
+// =============================================================================
+// TX SESSION STATE MACHINE
+// =============================================================================
+//
+// Manages the lifecycle of a transmission session:
+//   IDLE → (first frame) → PREAMBLE + ACTIVE → (gap) → HANGING → POSTAMBLE → IDLE
+//
+// This mirrors the Dialogus architecture where the modem layer autonomously
+// handles preamble/dummy/postamble framing. Interlocutor just sends real OV
+// frames over UDP and doesn't need to know about session management.
+
+struct TxSession {
+    enum State { IDLE, ACTIVE, HANGING };
+
+    State state = IDLE;
+    frame_t last_real_frame = {};     // most recent real frame (for dummy/postamble header)
+    bool have_real_frame = false;     // at least one real frame seen in this session
+    int dummy_count = 0;              // consecutive dummy frames sent in current hang
+    int hang_timer_frames = HANG_TIMER_FRAMES_DEFAULT;
+    int64_t next_deadline_us = 0;     // wall-clock time when next frame slot arrives
+
+    // Statistics for this session
+    uint64_t session_real_frames = 0;
+    uint64_t session_dummy_frames = 0;
+    int64_t session_start_us = 0;
+
+    bool is_idle() const { return state == IDLE; }
+
+    void start(int64_t now_us) {
+        state = ACTIVE;
+        dummy_count = 0;
+        session_real_frames = 0;
+        session_dummy_frames = 0;
+        session_start_us = now_us;
+        // First real frame was just emitted (preceded by preamble).
+        // Next frame slot is 40ms from now.
+        next_deadline_us = now_us + FRAME_PERIOD_US;
+    }
+
+    void real_frame_sent(const frame_t& frame) {
+        last_real_frame = frame;
+        have_real_frame = true;
+        session_real_frames++;
+        // If we were hanging (sending dummies), a real frame cancels it
+        dummy_count = 0;
+        state = ACTIVE;
+    }
+
+    void advance_deadline() {
+        next_deadline_us += FRAME_PERIOD_US;
+    }
+
+    // Returns poll timeout in milliseconds, clamped to [0, IDLE_POLL_TIMEOUT_MS]
+    int poll_timeout_ms(int64_t now_us) const {
+        if (state == IDLE) return IDLE_POLL_TIMEOUT_MS;
+        int64_t remaining_us = next_deadline_us - now_us;
+        if (remaining_us <= 0) return 0;
+        int ms = (int)(remaining_us / 1000);
+        return std::min(ms, IDLE_POLL_TIMEOUT_MS);
+    }
+
+    bool deadline_expired(int64_t now_us) const {
+        return state != IDLE && now_us >= next_deadline_us;
+    }
+
+    void reset() {
+        state = IDLE;
+        dummy_count = 0;
+        have_real_frame = false;
+        next_deadline_us = 0;
+        session_real_frames = 0;
+        session_dummy_frames = 0;
+        session_start_us = 0;
+    }
+};
+
+// =============================================================================
+// IQ OUTPUT HELPER
+// =============================================================================
+//
+// Common output path for all frame types (preamble, real, dummy, postamble).
+// Writes to stdout (PlutoSDR), IQ file, and/or loopback demod as configured.
+
+struct IQOutputContext {
+    bool tx_mode;
+    std::ofstream& iq_out;
+    PersistentDemodulator* demod;
+    bool loopback;
+};
+
+// Defined after PersistentDemodulator (needs full class definition for write_iq)
+void output_iq(const std::vector<IQSample>& iq, const IQOutputContext& ctx);
+void modulate_and_output(const frame_t& frame, HDLModulator& mod, const IQOutputContext& ctx);
+
+// =============================================================================
 // PERSISTENT DEMODULATOR SUBPROCESS
 // =============================================================================
 
@@ -477,6 +669,32 @@ private:
 };
 
 // =============================================================================
+// IQ OUTPUT FUNCTIONS (deferred - need full PersistentDemodulator definition)
+// =============================================================================
+
+void output_iq(const std::vector<IQSample>& iq, const IQOutputContext& ctx) {
+    if (ctx.iq_out.is_open()) {
+        ctx.iq_out.write(reinterpret_cast<const char*>(iq.data()),
+                         iq.size() * sizeof(IQSample));
+    }
+    if (ctx.tx_mode) {
+        std::cout.write(reinterpret_cast<const char*>(iq.data()),
+                        iq.size() * sizeof(IQSample));
+        std::cout.flush();
+    }
+    if (ctx.loopback && ctx.demod) {
+        ctx.demod->write_iq(iq);
+    }
+}
+
+void modulate_and_output(const frame_t& frame, HDLModulator& mod, const IQOutputContext& ctx) {
+    std::vector<IQSample> iq;
+    iq.reserve(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL);
+    modulate_frame(frame, mod, iq);
+    output_iq(iq, ctx);
+}
+
+// =============================================================================
 // UDP SERVER
 // =============================================================================
 
@@ -551,6 +769,7 @@ void usage(const char* prog) {
     std::cerr << "  -c CALL     Rewrite callsign on returned frames (loopback repeater)\n";
     std::cerr << "  -d PATH     Path to opv-demod binary (default: ./bin/opv-demod)\n";
     std::cerr << "  -o FILE     Save IQ to file\n";
+    std::cerr << "  -n FRAMES   Hang timer frames before postamble (default: 25)\n";
     std::cerr << "  -v          Verbose\n";
     std::cerr << "  -q          Quiet\n";
     std::cerr << "  -h          Help\n";
@@ -576,9 +795,10 @@ int main(int argc, char* argv[]) {
     std::string rewrite_callsign;
     uint8_t rewrite_callsign_bytes[6] = {};
     bool do_rewrite = false;
+    int hang_timer_frames = HANG_TIMER_FRAMES_DEFAULT;
     
     int opt;
-    while ((opt = getopt(argc, argv, "p:r:ltRc:d:o:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:r:ltRc:d:o:n:vqh")) != -1) {
         switch (opt) {
             case 'p': port = std::atoi(optarg); break;
             case 'r': response_port = std::atoi(optarg); break;
@@ -588,6 +808,7 @@ int main(int argc, char* argv[]) {
             case 'c': rewrite_callsign = optarg; break;
             case 'd': demod_path = optarg; break;
             case 'o': iq_file = optarg; break;
+            case 'n': hang_timer_frames = std::atoi(optarg); break;
             case 'v': verbose = true; break;
             case 'q': quiet = true; break;
             default: usage(argv[0]);
@@ -630,7 +851,7 @@ int main(int argc, char* argv[]) {
     
     if (!quiet) {
         std::cerr << "╔═══════════════════════════════════════════════════════════════════╗\n";
-        std::cerr << "║                    OPV Modem Server v1.3                          ║\n";
+        std::cerr << "║                    OPV Modem Server v2.0                          ║\n";
         std::cerr << "╚═══════════════════════════════════════════════════════════════════╝\n\n";
         if (rx_mode) {
             std::cerr << "  Mode:      RX (stdin → demod → UDP)\n";
@@ -655,6 +876,7 @@ int main(int argc, char* argv[]) {
         }
         if (!iq_file.empty())
             std::cerr << "  IQ File:   " << iq_file << "\n";
+        std::cerr << "  Session:   preamble(40ms) + hang(" << hang_timer_frames << " frames) + postamble\n";
         std::cerr << "\n";
     }
     
@@ -872,7 +1094,18 @@ int main(int argc, char* argv[]) {
     struct sockaddr_in last_sender = {};
     bool have_sender = false;
     
+    // Session management
+    TxSession session;
+    session.hang_timer_frames = hang_timer_frames;
+    uint64_t total_sessions = 0;
+    uint64_t total_dummy_frames = 0;
+    
+    // IQ output context (shared by preamble, real, dummy, and postamble)
+    IQOutputContext iq_ctx{tx_mode, iq_out, demod.get(), loopback};
+    
     while (g_running) {
+        int64_t now = get_time_us();
+        
         // Set up poll for both UDP and demod output
         struct pollfd fds[2];
         int nfds = 1;
@@ -886,14 +1119,20 @@ int main(int argc, char* argv[]) {
             nfds = 2;
         }
         
-        int ret = poll(fds, nfds, 100);  // 100ms timeout
+        // Adaptive timeout: tight during active session, relaxed when idle
+        int timeout_ms = session.poll_timeout_ms(now);
+        int ret = poll(fds, nfds, timeout_ms);
         
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
         
-        // Check for incoming UDP frames
+        now = get_time_us();  // refresh after poll
+        
+        // =================================================================
+        // HANDLE INCOMING UDP FRAMES (real content from Interlocutor)
+        // =================================================================
         if (fds[0].revents & POLLIN) {
             frame_t frame;
             struct sockaddr_in sender;
@@ -914,32 +1153,85 @@ int main(int argc, char* argv[]) {
                               << sender_ip << ":" << ntohs(sender.sin_port) << "\n";
                 }
                 
-                // Modulate
-                std::vector<IQSample> iq_samples;
-                iq_samples.reserve(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL);
-                modulate_frame(frame, modulator, iq_samples);
-                
-                // Save to file if requested
-                if (iq_out.is_open()) {
-                    iq_out.write(reinterpret_cast<char*>(iq_samples.data()),
-                                iq_samples.size() * sizeof(IQSample));
+                // --- Session start: emit preamble before first frame ---
+                if (session.is_idle()) {
+                    if (verbose) {
+                        std::cerr << "SESSION: Starting transmission for " << station_id << "\n";
+                    }
+                    
+                    // Emit 40ms preamble: raw 1100 pattern, no sync word or FEC
+                    std::vector<IQSample> preamble_iq;
+                    preamble_iq.reserve(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL);
+                    emit_preamble(modulator, preamble_iq);
+                    output_iq(preamble_iq, iq_ctx);
+                    
+                    if (verbose) {
+                        std::cerr << "SESSION: Preamble sent (" << FRAME_SYMBOLS
+                                  << " symbols, 40ms)\n";
+                    }
+                    
+                    session.start(get_time_us());
+                    total_sessions++;
                 }
                 
-                // Output to stdout if TX mode (for PlutoSDR)
-                if (tx_mode) {
-                    std::cout.write(reinterpret_cast<char*>(iq_samples.data()),
-                                   iq_samples.size() * sizeof(IQSample));
-                    std::cout.flush();
+                // --- Modulate and output the real frame ---
+                modulate_and_output(frame, modulator, iq_ctx);
+                session.real_frame_sent(frame);
+                
+                // Advance the deadline for the next frame slot.
+                // If we were hanging and just got a real frame, we take over
+                // the current slot and schedule the next one.
+                session.next_deadline_us = get_time_us() + FRAME_PERIOD_US;
+            }
+        }
+        
+        // =================================================================
+        // HANDLE FRAME DEADLINE EXPIRY (no real frame arrived in time)
+        // =================================================================
+        if (session.deadline_expired(now)) {
+            
+            if (!session.have_real_frame) {
+                // Edge case: session started but we lost the frame somehow.
+                // This shouldn't happen, but recover gracefully.
+                session.reset();
+            
+            } else if (session.dummy_count >= session.hang_timer_frames) {
+                // Hang time exhausted — send postamble and end session
+                frame_t postamble = make_postamble_frame(session.last_real_frame);
+                modulate_and_output(postamble, modulator, iq_ctx);
+                
+                if (verbose) {
+                    double duration_s = (double)(get_time_us() - session.session_start_us) / 1e6;
+                    std::cerr << "SESSION: Postamble sent — ending transmission\n";
+                    std::cerr << "SESSION: Session ended after " 
+                              << std::fixed << std::setprecision(1) << duration_s << "s ("
+                              << session.session_real_frames << " real + "
+                              << session.session_dummy_frames << " dummy + 1 postamble)\n";
                 }
                 
-                // Send to demodulator if loopback
-                if (loopback && demod) {
-                    demod->write_iq(iq_samples);
+                total_dummy_frames += session.session_dummy_frames;
+                session.reset();
+            
+            } else {
+                // Still hanging — send a dummy frame to keep the carrier alive
+                frame_t dummy = make_dummy_frame(session.last_real_frame);
+                modulate_and_output(dummy, modulator, iq_ctx);
+                
+                session.dummy_count++;
+                session.session_dummy_frames++;
+                session.state = TxSession::HANGING;
+                session.advance_deadline();
+                
+                if (verbose) {
+                    std::cerr << "SESSION: Dummy frame " << session.dummy_count
+                              << "/" << session.hang_timer_frames << "\n";
                 }
             }
         }
         
-        // Check for decoded frames from demodulator
+        // =================================================================
+        // HANDLE DECODED FRAMES FROM DEMODULATOR (loopback / repeater)
+        // =================================================================
         if (loopback && demod && nfds > 1 && (fds[1].revents & POLLIN)) {
             frame_t decoded;
             while (demod->try_read_frame(decoded)) {
@@ -983,6 +1275,15 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // If we're in a session when shutting down, send postamble
+    if (!session.is_idle() && session.have_real_frame) {
+        if (verbose) {
+            std::cerr << "SESSION: Sending postamble on shutdown\n";
+        }
+        frame_t postamble = make_postamble_frame(session.last_real_frame);
+        modulate_and_output(postamble, modulator, iq_ctx);
+    }
+    
     // Trailing zeros for file
     if (iq_out.is_open()) {
         std::array<IQSample, SAMPLES_PER_SYMBOL> zeros = {};
@@ -996,9 +1297,11 @@ int main(int argc, char* argv[]) {
     if (!quiet) {
         std::cerr << "\n═══════════════════════════════════════════════════════════════════\n";
         std::cerr << "Summary:\n";
-        std::cerr << "  TX:  " << g_frames_tx << " frames\n";
+        std::cerr << "  TX:       " << g_frames_tx << " real frames\n";
+        std::cerr << "  Dummy:    " << total_dummy_frames << " frames\n";
+        std::cerr << "  Sessions: " << total_sessions << "\n";
         if (loopback)
-            std::cerr << "  RX:  " << g_frames_rx << " frames\n";
+            std::cerr << "  RX:       " << g_frames_rx << " frames\n";
         std::cerr << "═══════════════════════════════════════════════════════════════════\n";
     }
     
