@@ -39,6 +39,8 @@ RX_GAIN=40
 BUFFER_SIZE=346880
 TX_PORT=57372                        # Listen for frames from Interlocutor
 RX_PORT=57373                        # Send decoded frames to Interlocutor
+PREAMBLE_FRAMES=1                    # Preamble frame periods (each 40ms)
+HANG_FRAMES=25                       # Dummy frames before postamble
 VERBOSE=0
 
 OPV_MODEM="$REPO_ROOT/bin/opv-modem"
@@ -74,6 +76,10 @@ Network Options:
   --tx-port PORT         UDP port to receive from Interlocutor (default: $TX_PORT)
   --rx-port PORT         UDP port to send to Interlocutor (default: $RX_PORT)
 
+Session Options:
+  -P, --preamble FRAMES  Preamble frame periods, each 40ms (default: $PREAMBLE_FRAMES)
+  -n, --hang FRAMES      Dummy frames before postamble (default: $HANG_FRAMES)
+
 Other:
   -v, --verbose          Verbose output
   -h, --help             Show this help
@@ -83,6 +89,7 @@ Examples:
   $(basename "$0") -f 905050000                       # 905.05 MHz simplex
   $(basename "$0") --tx-freq 435000000 --rx-freq 440000000  # Split
   $(basename "$0") -f 144390000 --tx-gain -10 --rx-gain 50  # 2m with custom gains
+  $(basename "$0") -f 905050000 -P 3 -n 30                  # Longer preamble + hang
 
 This script runs both TX and RX simultaneously:
   - Receives OPV frames from Interlocutor (UDP $TX_PORT) → transmits via Pluto
@@ -127,6 +134,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --rx-port)
             RX_PORT="$2"
+            shift 2
+            ;;
+        -P|--preamble)
+            PREAMBLE_FRAMES="$2"
+            shift 2
+            ;;
+        -n|--hang)
+            HANG_FRAMES="$2"
             shift 2
             ;;
         -u|--uri)
@@ -278,6 +293,7 @@ else
 fi
 echo "  TX Gain:    $TX_GAIN dB"
 echo "  RX Gain:    $RX_GAIN dB"
+echo "  Session:    preamble(${PREAMBLE_FRAMES}×40ms) + hang(${HANG_FRAMES} frames) + postamble"
 echo ""
 echo "  Interlocutor TX → UDP:$TX_PORT → Pluto TX"
 echo "  Pluto RX → UDP:$RX_PORT → Interlocutor RX"
@@ -296,9 +312,14 @@ $IIO_WRITE_CMD -u "$PLUTO_URI" -b "$BUFFER_SIZE" cf-ad9361-dds-core-lpc < "$TX_F
 IIO_TX_PID=$!
 
 # Start opv-modem TX mode writing to FIFO
-MODEM_TX_OPTS="-t -p $TX_PORT"
-[[ $VERBOSE -eq 1 ]] && MODEM_TX_OPTS="$MODEM_TX_OPTS -v"
-$OPV_MODEM $MODEM_TX_OPTS > "$TX_FIFO" 2>/dev/null &
+# IMPORTANT: stderr must NOT go into the FIFO — text bytes corrupt IQ alignment
+MODEM_TX_OPTS="-t -P $PREAMBLE_FRAMES -n $HANG_FRAMES -p $TX_PORT"
+if [[ $VERBOSE -eq 1 ]]; then
+    MODEM_TX_OPTS="$MODEM_TX_OPTS -v"
+    $OPV_MODEM $MODEM_TX_OPTS > "$TX_FIFO" 2>opv-tx.log &
+else
+    $OPV_MODEM $MODEM_TX_OPTS > "$TX_FIFO" 2>/dev/null &
+fi
 TX_PID=$!
 
 # =============================================================================
