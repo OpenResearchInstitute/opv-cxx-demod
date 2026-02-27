@@ -1208,6 +1208,16 @@ int main(int argc, char* argv[]) {
                 frame_t postamble = make_postamble_frame(session.last_real_frame);
                 modulate_and_output(postamble, modulator, iq_ctx);
                 
+                // Flush DMA pipeline: send 2 frames of silence so the PlutoSDR
+                // DMA buffer fully drains the postamble before the carrier drops.
+                // Without this, the postamble can sit in the DMA queue and leak
+                // into the next session's preamble.
+                {
+                    std::vector<IQSample> silence(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL, {0, 0});
+                    output_iq(silence, iq_ctx);
+                    output_iq(silence, iq_ctx);
+                }
+                
                 if (verbose) {
                     double duration_s = (double)(get_time_us() - session.session_start_us) / 1e6;
                     std::cerr << "SESSION: Postamble sent — ending transmission\n";
