@@ -27,6 +27,7 @@
  *   -d PATH     Path to opv-demod binary (default: ./bin/opv-demod)
  *   -o FILE     Also save IQ samples to file
  *   -n FRAMES   Hang timer frames before postamble (default: 25)
+ *   -P FRAMES   Preamble frame periods (default: 1, each 40ms)
  *   -v          Verbose output
  *   -q          Quiet mode
  * 
@@ -95,8 +96,8 @@ constexpr uint8_t G2_MASK = 0x6D;
 
 // Session management (matches Dialogus behavior)
 constexpr size_t OVP_HEADER_SIZE = 12;        // station ID(6) + token(3) + reserved(3)
-constexpr size_t OVP_PAYLOAD_SIZE = 122;      // payload portion of OV frame
 constexpr int    HANG_TIMER_FRAMES_DEFAULT = 25; // dummy frames before postamble (1000ms)
+constexpr int    PREAMBLE_FRAMES_DEFAULT = 1;    // preamble frame periods (40ms each)
 constexpr int    FRAME_PERIOD_US = 40000;     // 40ms per frame
 constexpr int    IDLE_POLL_TIMEOUT_MS = 100;  // poll timeout when idle
 
@@ -770,6 +771,7 @@ void usage(const char* prog) {
     std::cerr << "  -d PATH     Path to opv-demod binary (default: ./bin/opv-demod)\n";
     std::cerr << "  -o FILE     Save IQ to file\n";
     std::cerr << "  -n FRAMES   Hang timer frames before postamble (default: 25)\n";
+    std::cerr << "  -P FRAMES   Preamble frame periods (default: 1, each 40ms)\n";
     std::cerr << "  -v          Verbose\n";
     std::cerr << "  -q          Quiet\n";
     std::cerr << "  -h          Help\n";
@@ -796,9 +798,10 @@ int main(int argc, char* argv[]) {
     uint8_t rewrite_callsign_bytes[6] = {};
     bool do_rewrite = false;
     int hang_timer_frames = HANG_TIMER_FRAMES_DEFAULT;
+    int preamble_frames = PREAMBLE_FRAMES_DEFAULT;
     
     int opt;
-    while ((opt = getopt(argc, argv, "p:r:ltRc:d:o:n:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:r:ltRc:d:o:n:P:vqh")) != -1) {
         switch (opt) {
             case 'p': port = std::atoi(optarg); break;
             case 'r': response_port = std::atoi(optarg); break;
@@ -809,6 +812,7 @@ int main(int argc, char* argv[]) {
             case 'd': demod_path = optarg; break;
             case 'o': iq_file = optarg; break;
             case 'n': hang_timer_frames = std::atoi(optarg); break;
+            case 'P': preamble_frames = std::atoi(optarg); break;
             case 'v': verbose = true; break;
             case 'q': quiet = true; break;
             default: usage(argv[0]);
@@ -876,7 +880,7 @@ int main(int argc, char* argv[]) {
         }
         if (!iq_file.empty())
             std::cerr << "  IQ File:   " << iq_file << "\n";
-        std::cerr << "  Session:   preamble(40ms) + hang(" << hang_timer_frames << " frames) + postamble\n";
+        std::cerr << "  Session:   preamble(" << preamble_frames << "×40ms) + hang(" << hang_timer_frames << " frames) + postamble\n";
         std::cerr << "\n";
     }
     
@@ -1159,15 +1163,19 @@ int main(int argc, char* argv[]) {
                         std::cerr << "SESSION: Starting transmission for " << station_id << "\n";
                     }
                     
-                    // Emit 40ms preamble: raw 1100 pattern, no sync word or FEC
-                    std::vector<IQSample> preamble_iq;
-                    preamble_iq.reserve(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL);
-                    emit_preamble(modulator, preamble_iq);
-                    output_iq(preamble_iq, iq_ctx);
+                    // Emit preamble: raw 1100 pattern, no sync word or FEC
+                    // Each frame period is 40ms of carrier for demod acquisition
+                    for (int p = 0; p < preamble_frames; ++p) {
+                        std::vector<IQSample> preamble_iq;
+                        preamble_iq.reserve(FRAME_SYMBOLS * SAMPLES_PER_SYMBOL);
+                        emit_preamble(modulator, preamble_iq);
+                        output_iq(preamble_iq, iq_ctx);
+                    }
                     
                     if (verbose) {
-                        std::cerr << "SESSION: Preamble sent (" << FRAME_SYMBOLS
-                                  << " symbols, 40ms)\n";
+                        std::cerr << "SESSION: Preamble sent (" << preamble_frames
+                                  << "×" << FRAME_SYMBOLS << " symbols, "
+                                  << preamble_frames * 40 << "ms)\n";
                     }
                     
                     session.start(get_time_us());
