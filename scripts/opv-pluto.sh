@@ -298,7 +298,7 @@ IIO_TX_PID=$!
 # Start opv-modem TX mode writing to FIFO
 MODEM_TX_OPTS="-t -p $TX_PORT"
 [[ $VERBOSE -eq 1 ]] && MODEM_TX_OPTS="$MODEM_TX_OPTS -v"
-$OPV_MODEM $MODEM_TX_OPTS > "$TX_FIFO" 2>&1 &
+$OPV_MODEM $MODEM_TX_OPTS > "$TX_FIFO" 2>/dev/null &
 TX_PID=$!
 
 # =============================================================================
