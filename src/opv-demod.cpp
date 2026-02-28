@@ -1,10 +1,9 @@
 //------------------------------------------------------------------------------
-// opv-demod-tr.cpp - OPV MSK Demodulator with AFC + Symbol Timing Recovery
+// opv-demod.cpp - OPV MSK Demodulator v2.0
 //------------------------------------------------------------------------------
 // MSK demodulator with automatic frequency control, symbol timing recovery
-// (early-late gate TED with 2nd order loop), and proper sync tracking.
-// Uses correlation-based detection (robust) with frequency offset estimation
-// and correction (tracks drift).
+// (early-late gate TED with 2nd order loop), symbol lock detection, and
+// proper two-sync frame acquisition matching the HDL implementation.
 //
 // Signal parameters:
 //   MSK modulation: F1=-13550 Hz (bit '1'), F2=+13550 Hz (bit '0')
@@ -15,7 +14,11 @@
 // Architecture:
 //   - Dual-tone correlation with integrate-and-dump
 //   - AFC: estimates frequency offset from tone phase rotation
+//   - Symbol lock detector: gates frame sync search on TED convergence
 //   - State machine: HUNTING → VERIFYING → LOCKED (flywheel)
+//     • HUNTING: only searches when symbol timing is locked (TED gate)
+//     • VERIFYING: requires TWO consecutive sync hits to declare lock
+//     • LOCKED: flywheel tolerates up to 3 missed syncs before release
 //
 // Author: ORI/Abraxas3d collaboration
 // License: CERN-OHL-S v2
@@ -57,7 +60,7 @@ constexpr uint8_t G2_MASK = 0x6D;
 constexpr int NUM_STATES = 64;
 
 // Sync thresholds
-constexpr int SYNC_MISS_LIMIT = 5;          // Allow more misses before losing lock
+constexpr int SYNC_MISS_LIMIT = 3;          // Allow more misses before losing lock
 
 // OPV Header
 constexpr size_t OPV_STATION_ID_SIZE = 6;
@@ -80,6 +83,64 @@ const char* state_name(SyncState s) {
     }
     return "?";
 }
+
+//------------------------------------------------------------------------------
+// Symbol Lock Detector
+//------------------------------------------------------------------------------
+// Tracks the magnitude of the Timing Error Detector (TED) output over a
+// sliding window.  When the timing loop has converged on a real signal the
+// TED residual is small and stable; when running on noise it is large and
+// erratic.  This gate prevents the frame-sync correlator from searching on
+// noise, eliminating false locks that waste preamble frames.
+//
+// Hysteresis (separate lock/unlock thresholds) prevents chattering at the
+// boundary.  Window size of ~100 symbols ≈ 1/20 of a frame period — fast
+// enough to declare lock well within one preamble frame.
+//------------------------------------------------------------------------------
+class SymbolLockDetector {
+public:
+    static constexpr size_t  WINDOW        = 100;   // symbols to average
+    static constexpr double  LOCK_THRESH   = 0.25;  // avg |TED| below → locked
+    static constexpr double  UNLOCK_THRESH = 0.50;  // avg |TED| above → unlocked
+
+    SymbolLockDetector()
+        : buf_{}, idx_(0), sum_(0.0), count_(0), locked_(false) {}
+
+    // Call once per symbol with the raw TED output from the demodulator.
+    // Returns true when symbol timing is considered locked.
+    bool update(double ted) {
+        double mag = std::abs(ted);
+
+        // Subtract oldest value, add newest
+        sum_ -= buf_[idx_];
+        buf_[idx_] = mag;
+        sum_ += mag;
+        idx_ = (idx_ + 1) % WINDOW;
+        if (count_ < WINDOW) ++count_;
+
+        double avg = sum_ / count_;
+
+        if (!locked_ && count_ >= WINDOW && avg < LOCK_THRESH) {
+            locked_ = true;
+            fprintf(stderr, "[sym_lock] LOCKED  (avg |TED| = %.3f)\n", avg);
+        } else if (locked_ && avg > UNLOCK_THRESH) {
+            locked_ = false;
+            fprintf(stderr, "[sym_lock] UNLOCKED (avg |TED| = %.3f)\n", avg);
+        }
+
+        return locked_;
+    }
+
+    bool is_locked() const { return locked_; }
+    void reset() { sum_ = 0; count_ = 0; idx_ = 0; locked_ = false; buf_ = {}; }
+
+private:
+    std::array<double, WINDOW> buf_;
+    size_t idx_;
+    double sum_;
+    size_t count_;
+    bool locked_;
+};
 
 //------------------------------------------------------------------------------
 // Base-40 Decoder
@@ -115,7 +176,9 @@ public:
           mu_(0.0),              // Fractional sample offset (0 to 1)
           timing_freq_(0.0),     // Clock frequency offset estimate
           alpha_timing_(0.005),  // Timing loop proportional gain
-          beta_timing_(0.00001)  // Timing loop integral gain
+          beta_timing_(0.00001), // Timing loop integral gain
+          last_ted_(0.0),        // Last TED output (for symbol lock detector)
+          tracking_enabled_(true) // AFC/timing integrators active (frozen when no signal)
     {}
     
     // Linear interpolation
@@ -204,8 +267,10 @@ public:
     void set_freq_offset(double offset) { freq_offset_ = offset; }
     
     void demodulate(const sample_t* samples, size_t num_samples,
-                    std::vector<double>& soft_out) {
+                    std::vector<double>& soft_out,
+                    std::vector<double>* ted_out = nullptr) {
         soft_out.clear();
+        if (ted_out) ted_out->clear();
         
         double phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
         double phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
@@ -280,13 +345,22 @@ public:
             }
             
             // 2nd order loop filter
-            timing_freq_ += beta_timing_ * ted;
-            timing_freq_ = std::clamp(timing_freq_, -0.1, 0.1);  // Max 10% rate error
+            // Only update integrators when tracking a real signal.
+            // On noise the TED and AFC chase random correlations,
+            // causing drift that hurts acquisition when a real signal arrives.
+            if (tracking_enabled_) {
+                timing_freq_ += beta_timing_ * ted;
+                timing_freq_ = std::clamp(timing_freq_, -0.1, 0.1);
+            }
             double timing_adj = alpha_timing_ * ted + timing_freq_;
             timing_adj = std::clamp(timing_adj, -2.0, 2.0);  // Max 2 samples per symbol
             
+            // Record TED for symbol lock detector
+            last_ted_ = ted;
+            if (ted_out) ted_out->push_back(ted);
+            
             // === AFC ===
-            if (soft_out.size() > 1) {
+            if (tracking_enabled_ && soft_out.size() > 1) {
                 std::complex<double> dom, prev_dom;
                 if (e1 > e2) {
                     dom = corr_f1;
@@ -330,7 +404,9 @@ public:
     
     double get_freq_offset() const { return freq_offset_; }
     double get_timing_freq() const { return timing_freq_; }
+    double get_last_ted() const { return last_ted_; }
     void set_afc_bandwidth(double alpha) { afc_alpha_ = alpha; }
+    void set_tracking_enabled(bool en) { tracking_enabled_ = en; }
     size_t get_leftover() const { return leftover_samples_; }
 
 private:
@@ -344,6 +420,8 @@ private:
     double timing_freq_;     // Timing frequency offset estimate
     double alpha_timing_;    // Loop proportional gain
     double beta_timing_;     // Loop integral gain
+    double last_ted_;        // Last TED output for symbol lock detection
+    bool tracking_enabled_;   // When false, freeze AFC and timing integrators
     size_t leftover_samples_ = 0;
 };
 
@@ -591,7 +669,8 @@ public:
     SyncTracker() : state_(SyncState::HUNTING),
                     symbols_since_sync_(0), consecutive_misses_(0),
                     total_frames_(0), corr_buf_idx_(0),
-                    circ_write_idx_(0), total_symbols_(0) {
+                    circ_write_idx_(0), total_symbols_(0),
+                    symbol_locked_(false) {
         // Precompute sync word correlation pattern
         // For each bit: '1' expects negative soft (F1), '0' expects positive (F2)
         for (int i = 0; i < (int)SYNC_BITS; ++i) {
@@ -604,6 +683,7 @@ public:
         
         // Clear pending frame
         pending_frame_.reserve(ENCODED_BITS);
+        verified_frame_.reserve(ENCODED_BITS);
     }
     
     struct Result {
@@ -611,6 +691,23 @@ public:
         double sync_quality;  // Normalized correlation value (-1 to +1)
         std::vector<double> payload;  // The actual payload data (copied out)
     };
+    
+    // Symbol lock gate: call from main loop with SymbolLockDetector output
+    void set_symbol_lock(bool locked) {
+        if (!symbol_locked_ && locked) {
+            fprintf(stderr, "[sync] Symbol lock acquired — enabling frame sync search\n");
+        } else if (symbol_locked_ && !locked) {
+            fprintf(stderr, "[sync] Symbol lock lost — disabling frame sync search\n");
+            // If we lose symbol lock, drop back to HUNTING
+            if (state_ != SyncState::HUNTING) {
+                fprintf(stderr, "[sync] Forcing HUNTING (symbol lock lost)\n");
+                state_ = SyncState::HUNTING;
+                collecting_payload_ = false;
+                verified_frame_.clear();
+            }
+        }
+        symbol_locked_ = locked;
+    }
     
     Result process(double soft_val, size_t sym_idx) {
         Result res = {false, 0.0, {}};
@@ -633,6 +730,12 @@ public:
         
         switch (state_) {
         case SyncState::HUNTING: {
+            // ── Symbol lock gate ──────────────────────────────────────
+            // Don't search for frame sync until the timing loop has
+            // converged.  This prevents false locks on noise that would
+            // waste preamble frames while the flywheel runs down.
+            if (!symbol_locked_) break;
+            
             // Need at least 24 symbols before checking for sync
             if (total_symbols_ < SYNC_BITS) break;
             
@@ -655,26 +758,50 @@ public:
         }
         
         case SyncState::VERIFYING: {
-            if (symbols_since_sync_ >= ENCODED_BITS) {
-                // Frame complete - output it
-                res.frame_ready = true;
-                res.sync_quality = sync_quality_;
-                res.payload = std::move(pending_frame_);
-                total_frames_++;
-                
-                // Prepare for next frame
+            // ── Two-sync acquisition (matches HDL) ────────────────────
+            // Phase 1: collect payload after first sync hit
+            if (collecting_payload_ && pending_frame_.size() >= ENCODED_BITS) {
+                // Payload complete — stop collecting but stay in VERIFYING
+                collecting_payload_ = false;
+                verified_frame_ = std::move(pending_frame_);
+                verified_quality_ = sync_quality_;
                 pending_frame_.clear();
                 pending_frame_.reserve(ENCODED_BITS);
-                collecting_payload_ = false;  // Will start after next sync
+            }
+            
+            // Phase 2: verify second sync at frame boundary
+            if (symbols_since_sync_ >= FRAME_SYMBOLS) {
+                double raw_corr;
+                double corr = soft_correlate(&raw_corr);
                 
-                // Transition to LOCKED
-                state_ = SyncState::LOCKED;
-                consecutive_misses_ = 0;
-                
-                // symbols_since_sync_ stays at ENCODED_BITS
-                // Next sync expected in SYNC_BITS more symbols
-                
-                fprintf(stderr, "[%zu] VERIFYING→LOCKED (frame %d)\n", sym_idx, total_frames_);
+                if (corr >= SOFT_SYNC_LOCKED_THRESHOLD) {
+                    // ✓ Second sync confirmed — real signal
+                    state_ = SyncState::LOCKED;
+                    consecutive_misses_ = 0;
+                    total_frames_++;
+                    
+                    // Output the verified first frame
+                    res.frame_ready = true;
+                    res.sync_quality = verified_quality_;
+                    res.payload = std::move(verified_frame_);
+                    
+                    // Start collecting next frame's payload
+                    sync_quality_ = corr;
+                    collecting_payload_ = true;
+                    pending_frame_.clear();
+                    symbols_since_sync_ = 0;
+                    
+                    fprintf(stderr, "[%zu] VERIFYING→LOCKED (frame %d, verify corr=%.3f)\n", 
+                            sym_idx, total_frames_, corr);
+                } else {
+                    // ✗ Failed verification — false alarm, back to hunting
+                    state_ = SyncState::HUNTING;
+                    collecting_payload_ = false;
+                    verified_frame_.clear();
+                    
+                    fprintf(stderr, "[%zu] VERIFYING→HUNTING (verify FAILED, corr=%.3f)\n", 
+                            sym_idx, corr);
+                }
             }
             break;
         }
@@ -757,6 +884,7 @@ private:
     }
     
     SyncState state_;
+    bool symbol_locked_;     // Gate: don't search for sync unless timing is locked
     
     // Circular buffer for sync correlation (last 24 symbols)
     std::array<double, SYNC_BITS> soft_corr_buf_;
@@ -773,6 +901,10 @@ private:
     // Frame collection state
     bool collecting_payload_ = false;
     std::vector<double> pending_frame_;  // Collects payload symbols directly
+    
+    // Two-sync verification: holds first frame until second sync confirms
+    std::vector<double> verified_frame_;
+    double verified_quality_ = 0.0;
     
     size_t symbols_since_sync_;
     double sync_quality_;
@@ -981,11 +1113,11 @@ int main(int argc, char* argv[]) {
     if (!quiet) {
         fprintf(stderr, "╔═══════════════════════════════════════════════════════════════════╗\n");
         if (coherent)
-            fprintf(stderr, "║       OPV MSK Demodulator with Costas Loop v1.0 (coherent)       ║\n");
+            fprintf(stderr, "║    OPV MSK Demodulator v2.0 — Costas Loop (coherent)              ║\n");
         else if (streaming)
-            fprintf(stderr, "║       OPV MSK Demodulator with AFC v1.0 (streaming)              ║\n");
+            fprintf(stderr, "║    OPV MSK Demodulator v2.0 — SymLock + 2-Sync (streaming)        ║\n");
         else
-            fprintf(stderr, "║           OPV MSK Demodulator with AFC v1.0                       ║\n");
+            fprintf(stderr, "║    OPV MSK Demodulator v2.0 — SymLock + 2-Sync                    ║\n");
         fprintf(stderr, "╚═══════════════════════════════════════════════════════════════════╝\n\n");
     }
     
@@ -999,6 +1131,7 @@ int main(int argc, char* argv[]) {
         MSKDemodulatorAFC demod;
         SyncTracker tracker;
         FrameDecoder fdec;
+        SymbolLockDetector sym_lock;
         
         // Set initial offset if provided, otherwise start at 0
         if (have_init_offset) {
@@ -1037,12 +1170,18 @@ int main(int argc, char* argv[]) {
                     first_chunk = false;
                 }
                 
-                // Demodulate chunk
-                std::vector<double> soft;
-                demod.demodulate(chunk_buf.data(), chunk_buf.size(), soft);
+                // Demodulate chunk — also get TED values for symbol lock detection
+                std::vector<double> soft, ted_vals;
+                demod.demodulate(chunk_buf.data(), chunk_buf.size(), soft, &ted_vals);
                 
-                // Process through sync tracker
+                // Process through symbol lock detector → sync tracker
                 for (size_t i = 0; i < soft.size(); ++i) {
+                    // Update symbol lock detector with TED output
+                    double ted = (i < ted_vals.size()) ? ted_vals[i] : 0.0;
+                    bool sym_locked = sym_lock.update(ted);
+                    tracker.set_symbol_lock(sym_locked);
+                    demod.set_tracking_enabled(sym_locked);
+                    
                     auto res = tracker.process(soft[i], total_symbols + i);
                     
                     if (res.frame_ready && !res.payload.empty()) {
@@ -1077,9 +1216,10 @@ int main(int argc, char* argv[]) {
                 
                 // Periodic status update
                 if (!quiet && (total_samples % (size_t)(SAMPLE_RATE * 5) < CHUNK_SAMPLES)) {
-                    fprintf(stderr, "[%.1fs] %zu symbols, %d frames (%d perfect), AFC: %.1f Hz, TFreq: %.4f\n",
+                    fprintf(stderr, "[%.1fs] %zu symbols, %d frames (%d perfect), AFC: %.1f Hz, TFreq: %.4f, SymLock: %s\n",
                             total_samples / SAMPLE_RATE, total_symbols, decoded, perfect,
-                            demod.get_freq_offset(), demod.get_timing_freq());
+                            demod.get_freq_offset(), demod.get_timing_freq(),
+                            sym_lock.is_locked() ? "YES" : "no");
                 }
             }
         }
@@ -1182,6 +1322,9 @@ int main(int argc, char* argv[]) {
     SyncTracker tracker;
     FrameDecoder fdec;
     int decoded = 0, perfect = 0;
+    
+    // Batch mode: signal is present in the file, bypass symbol lock gate
+    tracker.set_symbol_lock(true);
     
     for (size_t i = 0; i < soft.size(); ++i) {
         auto res = tracker.process(soft[i], i);
