@@ -14,7 +14,7 @@ make
 make test
 
 # Full transceiver with Interlocutor
-./opv-pluto.sh -f 435000000 -v
+scripts/opv-pluto.sh -f 435000000 -v
 ```
 
 ## Signal Parameters
@@ -59,15 +59,15 @@ make test
 Full-duplex transceiver for use with Interlocutor. One script, just like Dialogus.
 
 ```bash
-./opv-pluto.sh                              # 435 MHz simplex (default)
-./opv-pluto.sh -f 905050000                 # 905.05 MHz
-./opv-pluto.sh -f 144390000 -v              # 2m band, verbose
-./opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
-./opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
+scripts/opv-pluto.sh                              # 435 MHz simplex (default)
+scripts/opv-pluto.sh -f 905050000                 # 905.05 MHz
+scripts/opv-pluto.sh -f 144390000 -v              # 2m band, verbose
+scripts/opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
+scripts/opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
 ```
 
 **Workflow:**
-1. Start `./opv-pluto.sh`
+1. Start `scripts/opv-pluto.sh`
 2. Start Interlocutor (TX to UDP 57372, listen on UDP 57373)
 3. Use Interlocutor to send messages and make calls
 
@@ -134,11 +134,16 @@ Output: 16-bit I/Q samples (little-endian) to stdout
 ### opv-demod - Demodulator
 
 ```
-Usage: bin/opv-demod [-s] [-r] < input.iq
+Usage: bin/opv-demod [options] < input.iq
 
 Options:
   -s            Streaming mode (real-time from radio)
   -r            Raw output (134-byte frames to stdout)
+  -c            Coherent mode (Costas loop, ~3dB SNR improvement)
+  -p <hz>       PLL bandwidth in Hz (default: 50, coherent mode only)
+  -a <bw>       AFC bandwidth alpha (default: 0.001)
+  -o <hz>       Initial frequency offset in Hz (streaming mode)
+  -q            Quiet mode (suppress all stderr output)
 
 Input: 16-bit I/Q samples (little-endian) from stdin
 
@@ -147,6 +152,7 @@ Features:
   - Symbol Timing Recovery (early-late gate timing error detector)
   - Soft-decision Viterbi decoding
   - Sync tracking with flywheel
+  - Optional coherent demodulation via 2nd-order Costas loop
 ```
 
 ## Standalone PlutoSDR Scripts
@@ -179,7 +185,6 @@ opv-cxx-demod/
 ├── Makefile              # Build system
 ├── README.md             # This file
 ├── LICENSE               # CERN-OHL-S-2.0
-├── opv-pluto.sh          # Full transceiver script
 ├── bin/                  # Built binaries (created by make)
 │   ├── opv-mod
 │   ├── opv-demod
@@ -189,6 +194,7 @@ opv-cxx-demod/
 │   ├── opv-demod.cpp     # Demodulator (self-contained)
 │   └── opv-modem.cpp     # Modem server (self-contained)
 ├── scripts/
+│   ├── opv-pluto.sh      # Full transceiver script
 │   ├── opv-pluto-rx.sh   # Standalone RX script
 │   └── opv-pluto-tx.sh   # Standalone TX script
 └── docs/
