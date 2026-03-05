@@ -196,13 +196,24 @@ opv-cxx-demod/
     └── filter-taps.ipynb # Filter design
 ```
 
+
 ## Interoperability
 
 - **Interlocutor**: Full integration via UDP (text messages, voice calls)
 - **Loopback**: Successfully modulates and demodulates to itself
 - **Demodulates**: LibreSDR HDL modem Locutus transmissions
-- **Modulation**: To Be Tested with LibreSDR HDL modem Locutus receiving
+- **Full duplex with Locutus+Dialogus**: Verified. Text and voice exchanged
+  in both directions between PlutoSDR (software modem and Interlocutor) and
+  LibreSDR (Locutus and Dialogus) at 905.050 MHz conducted (March 2026)
 - **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
+
+ **Integration note:** A first-frame corruption issue was observed when
+ receiving from Locutus. Root cause was a pipeline synchronization bug in
+ the Locutus HDL — the preamble generator was not synchronized with the
+ encoding pipeline, causing the preamble to overwrite the first data frame.
+ Fixed in Locutus HDL by KB5MU. If you observe clean lock from frame 2
+ onward but a bad or missing frame 1, suspect this class of problem in the
+ transmitting modem.
 
 ## Building
 
