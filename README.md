@@ -209,12 +209,10 @@ opv-cxx-demod/
 
  **Integration note:** A first-frame corruption issue was observed when
  receiving from Locutus. Root cause was a pipeline synchronization bug in
- the Locutus HDL — the preamble generator was not synchronized with the
+ the Locutus HDL. The preamble generator was not synchronized with the
  encoding pipeline, causing the preamble to overwrite the first data frame.
- Fixed in Locutus HDL by KB5MU. If you observe clean lock from frame 2
- onward but a bad or missing frame 1, suspect this class of problem in the
- transmitting modem.
-
+ Fixed in Locutus HDL. 
+ 
 ## Building
 
 Requirements:
