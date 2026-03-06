@@ -155,6 +155,24 @@ Features:
   - Optional coherent demodulation via 2nd-order Costas loop
 ```
 
+**Minimum burst length:** The sync state machine requires two frames to acquire
+lock (HUNTING → VERIFYING → LOCKED), so the first frame of any transmission is
+always consumed by acquisition. A burst of N frames will produce N-1 decoded
+frames at the receiver. For PTT-style operation, transmit at least 3 frames to
+guarantee one decoded frame at the far end. The preamble frames sent by
+`opv-modem` and `opv-pluto.sh` exist partly to allow the demodulator to acquire
+symbol timing before the first data frame arrives, but frame sync still requires
+two data frames to confirm.
+
+**Coherent mode note:** The `-c` flag enables a 2nd-order Costas loop for
+continuous carrier phase tracking, yielding a theoretical 3 dB SNR improvement
+over non-coherent detection. In synthetic loopback tests both modes perform
+identically due to the steep FEC waterfall masking the coherent gain. The
+advantage becomes meaningful under real hardware conditions — oscillator drift,
+phase noise, and dynamic Doppler on a live satellite pass. Use
+`make test-doppler FREQ_MHZ=<band>` to characterize Doppler performance for
+your operating frequency.
+
 ## Standalone PlutoSDR Scripts
 
 For use without Interlocutor (BERT testing, debugging).
