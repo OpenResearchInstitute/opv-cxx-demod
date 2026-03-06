@@ -446,7 +446,6 @@ public:
         : freq_offset_(0), carrier_phase_(0),
           phase_f1_(0), phase_f2_(0),
           loop_freq_(0),
-          afc_alpha_(0.001),
           // Costas loop gains (2nd order loop)
           // BW ~= 0.01 * symbol_rate for acquisition, narrower for tracking
           pll_alpha_(0.01),    // Phase gain (proportional)
@@ -606,25 +605,19 @@ public:
             // Limit loop frequency to avoid runaway
             loop_freq_ = std::clamp(loop_freq_, -0.1, 0.1);
             
-            // ===== AFC: COARSE FREQUENCY TRACKING =====
-            // This helps when residual offset exceeds PLL pull-in range
-            // Use phase rotation of dominant tone between symbols
-            if (sym > 0) {
-                double phase_diff = std::arg(dominant * std::conj(prev_dominant_));
-                double freq_err = phase_diff * SYMBOL_RATE / TWO_PI;
-                freq_offset_ += afc_alpha_ * freq_err;
-                freq_offset_ = std::clamp(freq_offset_, -2000.0, 2000.0);
-                
-                phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
-                phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
-            }
-            
-            prev_dominant_ = dominant;
+            // NOTE: Coarse inter-symbol AFC is intentionally absent here.
+            // The 2nd-order Costas loop already provides frequency tracking
+            // via its integral path (loop_freq_). Running a separate AFC that
+            // also updates freq_offset_ and recomputes phase_inc_f1/f2 would
+            // create two coupled feedback paths chasing the same residual offset,
+            // which can cause oscillation and degrades the 3dB coherent gain.
+            // The initial estimate_offset() call gets close enough for PLL
+            // pull-in before demodulate() is invoked. The Costas loop owns it
+            // from there.
         }
     }
     
     double get_freq_offset() const { return freq_offset_; }
-    void set_afc_bandwidth(double alpha) { afc_alpha_ = alpha; }
     
     // Set Costas loop bandwidth
     // Wider bandwidth: faster acquisition, more noise
@@ -643,8 +636,6 @@ private:
     double carrier_phase_;      // Carrier phase estimate
     double phase_f1_, phase_f2_;
     double loop_freq_;          // Loop frequency correction (radians per sample)
-    std::complex<double> prev_dominant_;
-    double afc_alpha_;
     double pll_alpha_;          // Phase error gain
     double pll_beta_;           // Frequency error gain
 };
@@ -1291,7 +1282,6 @@ int main(int argc, char* argv[]) {
         if (!quiet)
             fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
         
-        demod.set_afc_bandwidth(afc_bw);
         demod.set_pll_bandwidth(pll_bw);
         
         if (!quiet)
