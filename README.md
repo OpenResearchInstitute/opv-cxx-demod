@@ -14,7 +14,7 @@ make
 make test
 
 # Full transceiver with Interlocutor
-scripts/opv-pluto.sh -f 435000000 -v
+./opv-pluto.sh -f 435000000 -v
 ```
 
 ## Signal Parameters
@@ -59,15 +59,15 @@ scripts/opv-pluto.sh -f 435000000 -v
 Full-duplex transceiver for use with Interlocutor. One script, just like Dialogus.
 
 ```bash
-scripts/opv-pluto.sh                              # 435 MHz simplex (default)
-scripts/opv-pluto.sh -f 905050000                 # 905.05 MHz
-scripts/opv-pluto.sh -f 144390000 -v              # 2m band, verbose
-scripts/opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
-scripts/opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
+./opv-pluto.sh                              # 435 MHz simplex (default)
+./opv-pluto.sh -f 905050000                 # 905.05 MHz
+./opv-pluto.sh -f 144390000 -v              # 2m band, verbose
+./opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
+./opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
 ```
 
 **Workflow:**
-1. Start `scripts/opv-pluto.sh`
+1. Start `./opv-pluto.sh`
 2. Start Interlocutor (TX to UDP 57372, listen on UDP 57373)
 3. Use Interlocutor to send messages and make calls
 
@@ -185,6 +185,7 @@ opv-cxx-demod/
 ├── Makefile              # Build system
 ├── README.md             # This file
 ├── LICENSE               # CERN-OHL-S-2.0
+├── opv-pluto.sh          # Full transceiver script
 ├── bin/                  # Built binaries (created by make)
 │   ├── opv-mod
 │   ├── opv-demod
@@ -194,7 +195,6 @@ opv-cxx-demod/
 │   ├── opv-demod.cpp     # Demodulator (self-contained)
 │   └── opv-modem.cpp     # Modem server (self-contained)
 ├── scripts/
-│   ├── opv-pluto.sh      # Full transceiver script
 │   ├── opv-pluto-rx.sh   # Standalone RX script
 │   └── opv-pluto-tx.sh   # Standalone TX script
 └── docs/
@@ -202,23 +202,14 @@ opv-cxx-demod/
     └── filter-taps.ipynb # Filter design
 ```
 
-
 ## Interoperability
 
 - **Interlocutor**: Full integration via UDP (text messages, voice calls)
 - **Loopback**: Successfully modulates and demodulates to itself
 - **Demodulates**: LibreSDR HDL modem Locutus transmissions
-- **Full duplex with Locutus+Dialogus**: Verified. Text and voice exchanged
-  in both directions between PlutoSDR (software modem and Interlocutor) and
-  LibreSDR (Locutus and Dialogus) at 905.050 MHz conducted (March 2026)
+- **Modulation**: To Be Tested with LibreSDR HDL modem Locutus receiving
 - **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
 
- **Integration note:** A first-frame corruption issue was observed when
- receiving from Locutus. Root cause was a pipeline synchronization bug in
- the Locutus HDL. The preamble generator was not synchronized with the
- encoding pipeline, causing the preamble to overwrite the first data frame.
- Fixed in Locutus HDL. 
- 
 ## Building
 
 Requirements:
@@ -231,8 +222,22 @@ make            # Build all programs
 make test       # Verify loopback works
 make test-raw   # Test raw frame mode
 make test-rx    # Test RX mode UDP output
+make test-coherent                             # Verify coherent mode decodes as many frames as non-coherent
+make test-coherent-compare                     # Compare coherent vs non-coherent, static offset + noise
+make test-coherent-compare SNR=-5 OFFSET=300  # Custom conditions
+make test-doppler                              # LEO Doppler stress test at 905 MHz (default)
+make test-doppler FREQ_MHZ=433                # 70cm band (±11.3 kHz swing, 220 Hz/sec)
+make test-doppler FREQ_MHZ=2400               # 2.4 GHz (±62.4 kHz swing, 1200 Hz/sec)
+make test-doppler FREQ_MHZ=5000               # 5 GHz uplink (±130 kHz swing, 2535 Hz/sec)
 make clean      # Remove binaries
 ```
+
+Doppler rate scales with carrier frequency (`f · v²/c·h` at zenith for 400 km LEO).
+LEO is the worst case: HEO only reaches LEO rates briefly at perigee, GEO drifts
+a few Hz/sec. Note that synthetic Doppler tests may show equal coherent/non-coherent
+performance due to the FEC waterfall masking the 3 dB coherent gain — true
+validation of the coherent advantage requires over-the-air testing on a live
+satellite pass with real oscillator drift.
 
 ## License
 
