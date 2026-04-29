@@ -268,8 +268,10 @@ public:
             double I = d_s1 * sin_f1 + d_s2 * sin_f2;
             double Q = d_s1 * cos_f1 + d_s2 * cos_f2;
             
-            output[i].I = static_cast<int16_t>(16383.0 * I);
-            output[i].Q = static_cast<int16_t>(16383.0 * Q);
+            //output[i].I = static_cast<int16_t>(16383.0 * I);
+            //output[i].Q = static_cast<int16_t>(16383.0 * Q);
+            output[i].I = static_cast<int16_t>(32760.0 * I);
+            output[i].Q = static_cast<int16_t>(32760.0 * Q);
             
             phase_f1 += phase_inc_f1;
             phase_f2 += phase_inc_f2;
