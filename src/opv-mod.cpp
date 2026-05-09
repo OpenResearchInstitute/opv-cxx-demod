@@ -1,12 +1,19 @@
 /**
  * opv-mod.cpp - OPV MSK Modulator
- * 
+ *
  * Modes:
  *   -B N        BERT mode: generate N test frames internally
  *   -R          Raw mode: read 134-byte frames from stdin
- * 
+ *
+ * Options:
+ *   -P          Prepend one preamble frame before payload frames.
+ *               The preamble frame contains 2168 bits of 0xCC 
+ *               (1100 1100 repeating) sent raw (no FEC).
+ *               This gives the receiver's time to acquire symbol
+ *               timingbefore the first real frame arrives.
+ *
  * Matches HDL modulator implementation exactly.
- * 
+ *
  * Copyright 2026 Open Research Institute, Inc.
  * SPDX-License-Identifier: CERN-OHL-S-2.0
  */
@@ -362,6 +369,19 @@ frame_t build_bert_frame(const std::string& callsign, uint32_t token, uint32_t f
     return frame;
 }
 
+// Send one preamble frame: 2168 bits of 0xCC (raw, no FEC).
+void send_preamble_frame() {
+    send_sync_word();
+
+    std::array<IQSample, SAMPLES_PER_SYMBOL> samples;
+    constexpr uint8_t PREAMBLE_BYTE = 0xCC;  // 1100 1100 repeating
+    for (size_t i = 0; i < (ENCODED_BITS + 24); ++i) {
+        uint8_t bit = (PREAMBLE_BYTE >> (7 - (i % 8))) & 1;
+        g_mod.modulate_bit(bit, samples);
+        output(samples);
+    }
+}
+
 // Read a 134-byte frame from stdin (Raw mode)
 // Returns true if frame read successfully, false on EOF or error
 bool read_frame_from_stdin(frame_t& frame) {
@@ -400,6 +420,7 @@ void usage(const char* prog) {
     std::cerr << "\n";
     std::cerr << "Options:\n";
     std::cerr << "  -S CALLSIGN   Station callsign (required for BERT mode)\n";
+    std::cerr << "  -P            Prepend one preamble frame (0xCC pattern)\n";
     std::cerr << "  -t TOKEN      24-bit token (default: 0xBBAADD)\n";
     std::cerr << "  -c            Continuous mode (loop BERT forever)\n";
     std::cerr << "  -v            Verbose output to stderr\n";
@@ -408,6 +429,7 @@ void usage(const char* prog) {
     std::cerr << "\n";
     std::cerr << "Examples:\n";
     std::cerr << "  " << prog << " -S W5NYV -B 10              # 10 BERT frames\n";
+    std::cerr << "  " << prog << " -S W5NYV -P -B 10           # preamble + 10 BERT frames\n";
     std::cerr << "  " << prog << " -R < frames.bin             # Modulate pre-built frames\n";
     std::cerr << "  cat frames.bin | " << prog << " -R         # Same, via pipe\n";
     exit(1);
@@ -418,14 +440,16 @@ int main(int argc, char* argv[]) {
     int bert_frames = 0;
     bool continuous = false;
     bool raw_mode = false;
+    bool preamble = false;
     uint32_t token = 0xBBAADD;  // Default token
-    
+
     int opt;
-    while ((opt = getopt(argc, argv, "S:B:t:Rcvh")) != -1) {
+    while ((opt = getopt(argc, argv, "S:B:t:PRcvh")) != -1) {
         switch (opt) {
             case 'S': callsign = optarg; break;
             case 'B': bert_frames = std::atoi(optarg); break;
             case 't': token = std::strtoul(optarg, nullptr, 0); break;
+            case 'P': preamble = true; break;
             case 'R': raw_mode = true; break;
             case 'c': continuous = true; break;
             case 'v': g_verbose = true; break;
@@ -465,16 +489,24 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Token:    0x" << std::hex << token << std::dec << "\n";
             std::cerr << "  Frames:   " << bert_frames << "\n";
         }
+        std::cerr << "  Preamble: " << (preamble ? "yes (0xCC x2168)" : "no") << "\n";
         std::cerr << "  Conv encoder: G1=0x4F, G2=0x6D\n";
         std::cerr << "\n";
     }
     
     // =========================================================================
+    // PREAMBLE (optional, precedes all payload frames)
+    // =========================================================================
+    g_mod.reset();
+    if (preamble) {
+        send_preamble_frame();
+        if (g_verbose) std::cerr << "Preamble frame sent.\n";
+    }
+
+    // =========================================================================
     // RAW MODE: Read frames from stdin
     // =========================================================================
     if (raw_mode) {
-        g_mod.reset();
-        
         frame_t frame;
         uint64_t frame_count = 0;
         
@@ -503,9 +535,8 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     else {
         uint32_t frame_num = 0;
-        
+
         do {
-            g_mod.reset();
             
             for (int f = 0; f < bert_frames; ++f) {
                 if (g_reset_per_frame) {

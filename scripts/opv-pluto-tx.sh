@@ -240,7 +240,7 @@ echo "✓ PlutoSDR configured"
 # BUILD COMMAND
 # =============================================================================
 
-OPV_CMD="$OPV_MOD -S $CALLSIGN"
+OPV_CMD="$OPV_MOD -S $CALLSIGN -P"
 
 if [[ $BERT_FRAMES -gt 0 ]]; then
     OPV_CMD="$OPV_CMD -B $BERT_FRAMES"
