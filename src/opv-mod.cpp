@@ -10,7 +10,7 @@
  *               The preamble frame contains 2168 bits of 0xCC 
  *               (1100 1100 repeating) sent raw (no FEC).
  *               This gives the receiver's time to acquire symbol
- *               timingbefore the first real frame arrives.
+ *               timing before the first real frame arrives.
  *
  * Matches HDL modulator implementation exactly.
  *
@@ -371,11 +371,9 @@ frame_t build_bert_frame(const std::string& callsign, uint32_t token, uint32_t f
 
 // Send one preamble frame: 2168 bits of 0xCC (raw, no FEC).
 void send_preamble_frame() {
-    send_sync_word();
-
     std::array<IQSample, SAMPLES_PER_SYMBOL> samples;
     constexpr uint8_t PREAMBLE_BYTE = 0xCC;  // 1100 1100 repeating
-    for (size_t i = 0; i < (ENCODED_BITS + 24); ++i) {
+    for (size_t i = 0; i < (24 + ENCODED_BITS); ++i) {
         uint8_t bit = (PREAMBLE_BYTE >> (7 - (i % 8))) & 1;
         g_mod.modulate_bit(bit, samples);
         output(samples);
