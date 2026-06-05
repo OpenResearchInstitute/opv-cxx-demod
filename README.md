@@ -4,6 +4,22 @@
 
 Self-contained C++ implementations of the OPV modulator and demodulator, designed for use with PlutoSDR/LibreSDR hardware and Interlocutor.
 
+### Two ways to use this code
+
+1. **As standalone programs** (the original and primary use) — build with `make`
+   and run `opv-mod`, `opv-demod`, and `opv-modem` exactly as documented below.
+   Nothing here has changed: same commands, same behaviour, same PlutoSDR and
+   Interlocutor integration.
+
+2. **As a header-only library** — the receive DSP lives in `src/opv_demod.hpp`,
+   so another C++ design can embed the OPV demodulator directly. (For example, the
+   Haifuraiya satellite payload runs many demodulator instances across the
+   channelizer outputs instead of launching one program per channel.) See
+   [Using OPV as a Library](#using-opv-as-a-library-header-only).
+
+Both modes share the *exact same DSP code*, so the over-the-air format is
+identical no matter which way you use it.
+
 ## Quick Start
 
 ```bash
@@ -196,6 +212,95 @@ scripts/opv-pluto-tx.sh -S W5NYV -g -10      # Adjust TX gain
 
 Requires `iio_attr` and `iio_rwdev` (libiio-utils).
 
+## Using OPV as a Library (header-only)
+
+The OPV *receive* DSP — the MSK demodulators, symbol-lock detector, sync tracker,
+Viterbi decoder, and frame decoder — lives in a single header, `src/opv_demod.hpp`.
+The `opv-demod` program is now a thin shell that `#include`s that header and adds
+the command-line/streaming harness around it. **The program behaves exactly as it
+did before** (verified byte-for-byte against the previous single-file version);
+the header simply makes the same DSP reusable by other designs.
+
+Header-only means there is nothing extra to build or link — you include one file.
+This keeps the repo's self-contained, dependency-free character intact.
+
+### Adding it to your project
+
+As a git submodule:
+
+```bash
+git submodule add https://github.com/OpenResearchInstitute/opv-cxx-demod.git extern/opv
+```
+
+Then put `src/` on your include path and include the header:
+
+```cpp
+#include "opv_demod.hpp"   // compile with -Iextern/opv/src
+```
+
+### The API
+
+The header exposes the OPV receive chain as classes you instantiate and drive.
+One set of these objects represents one receive channel; a multi-channel design
+holds many independent instances and feeds each one blocks of complex baseband.
+
+| Class | Role | Key methods / accessors |
+|-------|------|--------------------------|
+| **`ChannelReceiver`** | **High-level: one channel's full receive chain (demod + symbol lock + sync + FEC). Feed it IQ blocks, get decoded frames.** | **`process(samples, n, on_frame)`, `process(samples, n) → vector<Frame>`, `set_freq_offset()`, `estimate_offset()`, `sync_state()`, `total_symbols()`** |
+| `MSKDemodulatorAFC` | Non-coherent MSK demod with AFC + early-late timing recovery | `demodulate(samples, n, soft_out)`, `set_freq_offset()`, `get_freq_offset()`, `set_tracking_enabled()`, `set_afc_bandwidth()` |
+| `CoherentMSKDemodulator` | Coherent (Costas-loop) variant, ~3 dB SNR gain | same `demodulate()` shape |
+| `SymbolLockDetector` | Gates frame-sync search until symbol timing converges | — |
+| `SyncTracker` | Frame sync state machine (HUNTING → VERIFYING → LOCKED) | `get_state()` |
+| `ViterbiDecoder` / `FrameDecoder` | Soft-decision FEC + frame extraction | — |
+| `decode_base40()` | Decode a Base-40 Station ID field | free function |
+
+Most consumers want **`ChannelReceiver`** — it owns the whole chain and hands
+back decoded frames. The lower-level classes are exposed for hosts that need to
+wire a custom orchestration.
+
+The sample type is `sample_t` (`std::complex<double>`); IQ blocks are passed as a
+`const sample_t*` plus length, and soft symbol decisions come back as a
+`std::vector<double>`.
+
+### Minimal example
+
+A complete, compilable example lives in [`examples/use_as_library.cpp`](examples/use_as_library.cpp):
+
+```cpp
+#include "opv_demod.hpp"
+
+ChannelReceiver rx;                 // one instance per channel
+rx.set_freq_offset(0.0);           // or rx.estimate_offset(block, n) on first block
+
+std::vector<sample_t> block(/* IQ samples */);
+rx.process(block.data(), block.size(),
+           [](const ChannelReceiver::Frame& f) {
+               // delivered the instant a frame completes:
+               // f.bytes (134 B), f.metric (0 = perfect), f.sync_quality
+           });
+```
+
+Build it:
+
+```bash
+g++ -std=c++17 -O3 -Isrc examples/use_as_library.cpp -o use_as_library
+```
+
+### Note on orchestration
+
+`ChannelReceiver` *is* the orchestration: it owns the demod → symbol lock → sync
+tracker → Viterbi → frame decoder chain and the streaming bookkeeping, and emits
+each decoded frame through your callback the moment it completes (or into a
+`vector` via the convenience overload). A multi-channel host such as dogu holds
+one `ChannelReceiver` per channel and schedules blocks across them; the I/O
+source and cross-channel scheduling stay host-specific, while the per-channel
+chain is shared.
+
+Crucially, the standalone `opv-demod` program's streaming mode is built on the
+very same `ChannelReceiver` — so the loopback, coherent, and Doppler tests in
+this repo exercise the exact code a host reuses. (The callback form delivers
+frames inline, byte-for-byte preserving the original streaming output.)
+
 ## Directory Structure
 
 ```
@@ -209,9 +314,12 @@ opv-cxx-demod/
 │   ├── opv-demod
 │   └── opv-modem
 ├── src/
-│   ├── opv-mod.cpp       # Modulator (self-contained)
-│   ├── opv-demod.cpp     # Demodulator (self-contained)
+│   ├── opv-mod.cpp       # Modulator program (self-contained)
+│   ├── opv-demod.cpp     # Demodulator program — thin shell over opv_demod.hpp
+│   ├── opv_demod.hpp     # Demodulator DSP core (header-only library)
 │   └── opv-modem.cpp     # Modem server (self-contained)
+├── examples/
+│   └── use_as_library.cpp  # Minimal header-only library usage example
 ├── scripts/
 │   ├── opv-pluto-rx.sh   # Standalone RX script
 │   └── opv-pluto-tx.sh   # Standalone TX script
@@ -236,7 +344,9 @@ Requirements:
 - libiio-utils for PlutoSDR scripts
 
 ```bash
-make            # Build all programs
+make            # Build all programs for the host (x86)
+make TARGET=pluto   # Cross-compile for PlutoSDR  (ARMv7-A Cortex-A9 + NEON)
+make TARGET=a53     # Cross-compile for Haifuraiya (ZCU102 A53, aarch64)
 make test       # Verify loopback works
 make test-raw   # Test raw frame mode
 make test-rx    # Test RX mode UDP output

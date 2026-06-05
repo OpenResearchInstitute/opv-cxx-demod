@@ -1,23 +1,64 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -O3 -Wall
-BINDIR = bin
+# OPV Modem - build system
+#
+# Targets (what platform the binaries run on):
+#   make                # host (x86) build for development + the test suite below
+#   make TARGET=pluto   # PlutoSDR  : ARMv7-A Cortex-A9 + NEON      (Vox Opus runtime)
+#   make TARGET=a53     # Haifuraiya: ARMv8-A Cortex-A53 (aarch64)   (dogu runtime)
+#
+# The test-* targets run binaries locally, so they use the default host build.
+# Cross targets are build-only (you can't run a53/pluto binaries on the host).
+#
+# Cross toolchains are set per target below; override CXX on the command line if
+# yours differs (command line beats the Makefile assignment). For the PetaLinux SDK:
+#   make TARGET=a53 CXX=aarch64-xilinx-linux-g++ SYSROOT=<sdk-sysroot>
+#
+# NOTE: cross branches use '=' not '?=' on purpose -- GNU Make pre-defines CXX=g++
+# as a built-in and '?=' will NOT override a built-in, which would silently build
+# the cross targets with the host compiler.
+#
+# Optimization flags (-ffast-math -fcx-limited-range -ftree-vectorize) are shared
+# across targets; they were verified to keep decode bit-perfect and give the bulk
+# of the speedup. For stricter FP, drop -ffast-math but keep -fcx-limited-range.
 
-all: $(BINDIR)/opv-mod $(BINDIR)/opv-demod $(BINDIR)/opv-modem
+TARGET ?= host
+COMMON_FLAGS = -std=c++17 -O3 -ffast-math -fcx-limited-range -ftree-vectorize -Wall
+
+ifeq ($(TARGET),host)
+  CXX       ?= g++
+  ARCH_FLAGS = -march=native
+  BINDIR     = bin
+else ifeq ($(TARGET),pluto)
+  CXX        = arm-linux-gnueabihf-g++
+  ARCH_FLAGS = -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard
+  BINDIR     = bin/pluto
+else ifeq ($(TARGET),a53)
+  CXX        = aarch64-linux-gnu-g++
+  ARCH_FLAGS = -mcpu=cortex-a53
+  BINDIR     = bin/a53
+  ifdef SYSROOT
+    ARCH_FLAGS += --sysroot=$(SYSROOT)
+  endif
+else
+  $(error Unknown TARGET '$(TARGET)'. Use: host, pluto, or a53)
+endif
+
+CXXFLAGS = $(COMMON_FLAGS) $(ARCH_FLAGS)
+PROGS = opv-mod opv-demod opv-modem
+
+all: $(addprefix $(BINDIR)/,$(PROGS))
+	@echo "Built TARGET=$(TARGET) -> $(BINDIR)/  ($(CXX))"
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
-$(BINDIR)/opv-mod: src/opv-mod.cpp | $(BINDIR)
+$(BINDIR)/%: src/%.cpp | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -o $@ $< -lm
 
-$(BINDIR)/opv-demod: src/opv-demod.cpp | $(BINDIR)
-	$(CXX) $(CXXFLAGS) -o $@ $< -lm
-
-$(BINDIR)/opv-modem: src/opv-modem.cpp | $(BINDIR)
-	$(CXX) $(CXXFLAGS) -o $@ $< -lm
+# opv-demod now includes the header-only DSP core; rebuild it if the header changes.
+$(BINDIR)/opv-demod: src/opv_demod.hpp
 
 clean:
-	rm -rf $(BINDIR)
+	rm -rf bin
 
 # Basic loopback test (mod → demod)
 test: all
