@@ -43,7 +43,7 @@ else
 endif
 
 CXXFLAGS = $(COMMON_FLAGS) $(ARCH_FLAGS)
-PROGS = opv-mod opv-demod opv-modem
+PROGS = opv-mod opv-demod opv-modem opv-resample
 
 all: $(addprefix $(BINDIR)/,$(PROGS))
 	@echo "Built TARGET=$(TARGET) -> $(BINDIR)/  ($(CXX))"
