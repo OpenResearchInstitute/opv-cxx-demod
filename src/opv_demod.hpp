@@ -447,102 +447,100 @@ public:
     {}
     
     // Estimate carrier offset from spectrum (coarse AFC) - same as non-coherent
+    // ---- iterative radix-2 FFT (in-place, N a power of two) ----
+    static void fft_inplace(std::vector<std::complex<double>>& a) {
+        size_t N = a.size();
+        for (size_t i = 1, j = 0; i < N; ++i) {          // bit-reversal permutation
+            size_t bit = N >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) std::swap(a[i], a[j]);
+        }
+        for (size_t len = 2; len <= N; len <<= 1) {
+            double ang = -TWO_PI / (double)len;
+            std::complex<double> wlen(std::cos(ang), std::sin(ang));
+            for (size_t i = 0; i < N; i += len) {
+                std::complex<double> w(1.0, 0.0);
+                for (size_t k = 0; k < len/2; ++k) {
+                    std::complex<double> u = a[i+k], v = a[i+k+len/2]*w;
+                    a[i+k] = u + v; a[i+k+len/2] = u - v;
+                    w *= wlen;
+                }
+            }
+        }
+    }
+
+    // de Buda coarse carrier estimate. Squaring removes the MSK data, leaving
+    // spectral lines at 2*foff +/- 2*FREQ_DEV; their midpoint/2 is foff. Returns
+    // the REFERENCE CORRECTION (= -foff): set_freq_offset() of this value centres
+    // the tone correlators so the Costas only has to track the residual. (The
+    // seed sign was validated in the offline model -- +foff diverges.)
+    // de Buda coarse carrier estimate (Welch-averaged for low-SNR robustness).
+    // Square removes the MSK data -> deterministic lines at 2*foff +/- 2*FREQ_DEV;
+    // averaging |FFT(s^2)|^2 over many windows stacks the lines while noise averages
+    // down. Midpoint of the two lines is 2*foff. Returns the REFERENCE CORRECTION
+    // (= -foff) for set_freq_offset(); a confidence gate returns 0 (do no harm) when
+    // no clear line is present. Seed sign validated in the offline model.
+    // de Buda coarse carrier estimate (Welch-averaged, joint two-line search).
+    // Squaring removes the MSK data, leaving deterministic lines at 2*foff +/- 2*FREQ_DEV
+    // (always exactly 4*FREQ_DEV apart). Averaging |FFT(s^2)|^2 over many windows stacks
+    // the lines while noise averages down; a joint scan over candidate offsets finds the
+    // pair. Returns the REFERENCE CORRECTION (= -foff) for set_freq_offset(); a confidence
+    // gate returns 0 (do no harm) when no clear pair is present. Seed sign and the +/-15 kHz
+    // span (LEO Doppler at 435 MHz + LO offset) chosen to cover real on-orbit conditions.
     double estimate_offset(const sample_t* samples, size_t num_samples) {
-        (void)samples; (void)num_samples; return 0.0;  // Milestone 1: perfect-carrier (OFFSET=0); de Buda replaces this
-        double best_offset = 0;
-        double best_energy = 0;
-        
-        for (double offset = -1500; offset <= 1500; offset += 25) {
-            double phase_f1 = 0, phase_f2 = 0;
-            double phase_inc_f1 = TWO_PI * (-FREQ_DEV + offset) / SAMPLE_RATE;
-            double phase_inc_f2 = TWO_PI * (+FREQ_DEV + offset) / SAMPLE_RATE;
-            
-            double total_energy = 0;
-            size_t test_samples = std::min(num_samples, size_t(SAMPLES_PER_SYMBOL * 1000));
-            
-            for (size_t sym = 0; sym < test_samples / SAMPLES_PER_SYMBOL; ++sym) {
-                std::complex<double> corr_f1(0), corr_f2(0);
-                
-                for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
-                    size_t idx = sym * SAMPLES_PER_SYMBOL + i;
-                    std::complex<double> lo_f1(std::cos(phase_f1), std::sin(phase_f1));
-                    std::complex<double> lo_f2(std::cos(phase_f2), std::sin(phase_f2));
-                    
-                    corr_f1 += samples[idx] * std::conj(lo_f1);
-                    corr_f2 += samples[idx] * std::conj(lo_f2);
-                    
-                    phase_f1 += phase_inc_f1;
-                    phase_f2 += phase_inc_f2;
-                }
-                
-                total_energy += std::norm(corr_f1) + std::norm(corr_f2);
-            }
-            
-            if (total_energy > best_energy) {
-                best_energy = total_energy;
-                best_offset = offset;
-            }
+        const size_t W = 32768;
+        if (num_samples < W) return 0.0;
+        const size_t K = std::min<size_t>(512, num_samples / W);
+        std::vector<double> P(W, 0.0);
+        std::vector<std::complex<double>> buf(W);
+        for (size_t w = 0; w < K; ++w) {
+            const sample_t* base = samples + w * W;
+            for (size_t i = 0; i < W; ++i) { std::complex<double> s = base[i]; buf[i] = s * s; }
+            fft_inplace(buf);
+            for (size_t k = 0; k < W; ++k) P[k] += std::norm(buf[k]);
         }
-        
-        // Fine tune
-        double fine_best = best_offset;
-        for (double offset = best_offset - 30; offset <= best_offset + 30; offset += 5) {
-            double phase_f1 = 0, phase_f2 = 0;
-            double phase_inc_f1 = TWO_PI * (-FREQ_DEV + offset) / SAMPLE_RATE;
-            double phase_inc_f2 = TWO_PI * (+FREQ_DEV + offset) / SAMPLE_RATE;
-            
-            double total_energy = 0;
-            size_t test_samples = std::min(num_samples, size_t(SAMPLES_PER_SYMBOL * 1000));
-            
-            for (size_t sym = 0; sym < test_samples / SAMPLES_PER_SYMBOL; ++sym) {
-                std::complex<double> corr_f1(0), corr_f2(0);
-                
-                for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
-                    size_t idx = sym * SAMPLES_PER_SYMBOL + i;
-                    std::complex<double> lo_f1(std::cos(phase_f1), std::sin(phase_f1));
-                    std::complex<double> lo_f2(std::cos(phase_f2), std::sin(phase_f2));
-                    
-                    corr_f1 += samples[idx] * std::conj(lo_f1);
-                    corr_f2 += samples[idx] * std::conj(lo_f2);
-                    
-                    phase_f1 += phase_inc_f1;
-                    phase_f2 += phase_inc_f2;
-                }
-                
-                total_energy += std::norm(corr_f1) + std::norm(corr_f2);
-            }
-            
-            if (total_energy > best_energy) {
-                best_energy = total_energy;
-                fine_best = offset;
-            }
+        const double binHz = SAMPLE_RATE / (double)W;
+        auto Pat = [&](double f)->double {              // power at frequency f (wraps)
+            long k = std::lround(f / binHz) % (long)W; if (k < 0) k += (long)W;
+            return P[(size_t)k];
+        };
+        // joint scan: the two lines sit at 2*foff +/- 2*FREQ_DEV
+        const double foff_max = 5000.0;   // pre-corrected residual + LO offset; widen if uncorrected
+        double best = -1.0, bestf = 0.0;
+        for (double fc = -foff_max; fc <= foff_max; fc += binHz * 0.5) {
+            double sc = Pat(2.0*fc - 2.0*FREQ_DEV) + Pat(2.0*fc + 2.0*FREQ_DEV);
+            if (sc > best) { best = sc; bestf = fc; }
         }
-        
-        return fine_best;
+        std::vector<double> tmp(P);                      // confidence gate vs median floor
+        std::nth_element(tmp.begin(), tmp.begin() + W/2, tmp.end());
+        double floor = tmp[W/2] + 1e-12;
+        if (best < 16.0 * floor) return 0.0;             // no clear pair -> don't detune
+        return -bestf;                                   // reference correction
     }
     
     void set_freq_offset(double offset) { freq_offset_ = offset; }
     
-    void demodulate(const sample_t* samples, size_t num_samples,
-                    std::vector<double>& soft_out) {
-        soft_out.clear();
+    // Front-end (batch / native 40 sps): per-symbol tone correlations over fixed
+    // integer windows, continuous-phase reference. Active tone lands its energy
+    // on the imaginary axis (sign = differential precoding); wrong-tone crosstalk
+    // lands on the real axis. Feeds combine(); the fractional track_correlations()
+    // is the channelized-rate alternative. No sync word -- protocol-agnostic.
+    void batch_correlations(const sample_t* samples, size_t num_samples,
+                            std::vector<std::complex<double>>& Y1,
+                            std::vector<std::complex<double>>& Y2) const {
         size_t nsym = num_samples / SAMPLES_PER_SYMBOL;
+        Y1.assign(nsym, std::complex<double>(0,0));
+        Y2.assign(nsym, std::complex<double>(0,0));
         if (nsym < 3) return;
-
-        // --- Per-symbol tone correlations, continuous-phase reference ---
-        // Y_k = sum_n s[n] * conj(e^{-j 2pi f n / Fs}). The active tone lands its
-        // energy on the imaginary axis (sign = differential precoding); the
-        // wrong-tone crosstalk lands on the real axis. Keeping only Im() rejects
-        // that crosstalk -- the basis of the coherent advantage.
         const double inc1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
         const double inc2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
-        const std::complex<double> w1(std::cos(inc1), std::sin(inc1));   // e^{+j inc}
+        const std::complex<double> w1(std::cos(inc1), std::sin(inc1));
         const std::complex<double> w2(std::cos(inc2), std::sin(inc2));
-        std::vector<std::complex<double>> Y1(nsym), Y2(nsym);
         for (size_t k = 0; k < nsym; ++k) {
             double b1 = inc1 * (double)(k * SAMPLES_PER_SYMBOL);
             double b2 = inc2 * (double)(k * SAMPLES_PER_SYMBOL);
-            std::complex<double> lo1(std::cos(b1), std::sin(b1));        // e^{+j inc * n}
+            std::complex<double> lo1(std::cos(b1), std::sin(b1));
             std::complex<double> lo2(std::cos(b2), std::sin(b2));
             std::complex<double> a1(0,0), a2(0,0);
             for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
@@ -552,48 +550,120 @@ public:
             }
             Y1[k] = a1;  Y2[k] = a2;
         }
+    }
+    double get_freq_offset() const { return freq_offset_; }
 
-        // --- Decision-switched Costas carrier recovery (Hodgart form) ---
-        // De-rotate each symbol's tone correlations by the tracked carrier phase,
-        // then take Im() for the Massey arms. The active tone is driven onto the
-        // imaginary axis (its energy axis), so Re(active) -> 0. Error sign (-1) and
-        // loop gains were validated against the offline model with offsets present.
-        std::vector<double> X(nsym, 0.0), Yv(nsym, 0.0);  // de-rotated Im(Y1), Im(Y2)
+    // ====================================================================
+    // Fractional-timing front-end (for the A53 / native channelized rate)
+    // --------------------------------------------------------------------
+    // The batch demodulate() above assumes an integer SAMPLES_PER_SYMBOL and
+    // fixed windows k*SPS. At a channelized rate (~11.53 sps for a 625 ksps
+    // FunCube+ channel) the samples/symbol is non-integer, so we recover symbol
+    // timing with a PI loop instead of slicing fixed windows. SPS becomes a
+    // nominal real number (sps_nom_); the loop tracks the true symbol instants.
+    //
+    // track_correlations() emits the per-symbol tone correlations Y1,Y2 at the
+    // recovered instants -- the SAME quantities the batch path builds -- so the
+    // existing Costas + Massey + parity back-end consumes them unchanged.
+    // ====================================================================
+    void set_nominal_sps(double sps) { sps_nom_ = sps; }
+    double get_nominal_sps() const { return sps_nom_; }
+
+    // Design the PI timing loop from a normalized loop bandwidth (Bn*T) and
+    // damping. ted_slope_ is the measured normalized TED gain (err per sample
+    // of timing error); defaults are validated in the offline model.
+    void set_timing_bandwidth(double BnT, double zeta = 1.0) {
+        double wnT = TWO_PI * BnT;
+        alpha_t_ = (2.0 * zeta * wnT) / ted_slope_;
+        beta_t_  = (wnT * wnT)        / ted_slope_;
+    }
+    void set_timing_gains(double a, double b) { alpha_t_ = a; beta_t_ = b; }
+
+    // Interpolating matched filter: tone correlations over one symbol of length
+    // sps_nom_, sampled at MF_M sub-points, continuous-phase reference evaluated
+    // at the absolute fractional position `base`. Mirrors the batch reference
+    // (lo = e^{+j inc n}; Y = sum s*lo) but at fractional positions.
+    void corr_at(const sample_t* s, size_t n, double base,
+                 std::complex<double>& Y1, std::complex<double>& Y2) const {
+        const double Fs   = sps_nom_ * SYMBOL_RATE;
+        const double inc1 = TWO_PI * (-FREQ_DEV + freq_offset_) / Fs;
+        const double inc2 = TWO_PI * (+FREQ_DEV + freq_offset_) / Fs;
+        const int    M    = std::max(MF_M, (int)std::lround(sps_nom_)); // >=1 sub-sample/sample
+        const double step = sps_nom_ / (double)M;
+        std::complex<double> lo1(std::cos(inc1*base), std::sin(inc1*base));
+        std::complex<double> lo2(std::cos(inc2*base), std::sin(inc2*base));
+        const std::complex<double> w1(std::cos(inc1*step), std::sin(inc1*step));
+        const std::complex<double> w2(std::cos(inc2*step), std::sin(inc2*step));
+        std::complex<double> a1(0,0), a2(0,0);
+        for (int j = 0; j < M; ++j) {
+            double p = base + j*step;
+            sample_t v = interp_lin(s, p, n);
+            a1 += v*lo1;  a2 += v*lo2;
+            lo1 *= w1;    lo2 *= w2;
+        }
+        Y1 = a1;  Y2 = a2;
+    }
+
+    // PI timing loop with normalized ML-gradient TED (err = Re{conj(y)*dy/dtau},
+    // y the dominant tone). Produces timing-recovered Y1,Y2.
+    void track_correlations(const sample_t* s, size_t n,
+                            std::vector<std::complex<double>>& Y1o,
+                            std::vector<std::complex<double>>& Y2o) {
+        Y1o.clear();  Y2o.clear();
+        const double EL = el_offset_;
+        double pos = EL + 1.0, freq = 0.0;
+        while (pos + sps_nom_ + EL + 2.0 < (double)n) {
+            std::complex<double> Y1, Y2, Y1e, Y2e, Y1l, Y2l;
+            corr_at(s, n, pos,      Y1,  Y2);
+            corr_at(s, n, pos - EL, Y1e, Y2e);
+            corr_at(s, n, pos + EL, Y1l, Y2l);
+            bool t1 = std::norm(Y1) > std::norm(Y2);
+            std::complex<double> ya = t1 ? Y1 : Y2;
+            std::complex<double> dy = t1 ? (Y1l - Y1e) : (Y2l - Y2e);
+            double err = (ya.real()*dy.real() + ya.imag()*dy.imag())
+                       / (std::norm(ya) + 1e-9);
+            freq += beta_t_ * err;
+            freq  = std::clamp(freq, -0.05, 0.05);
+            double adj = alpha_t_ * err + freq;
+            adj = std::clamp(adj, -2.0, 2.0);
+            Y1o.push_back(Y1);  Y2o.push_back(Y2);
+            pos += sps_nom_ + adj;
+        }
+    }
+
+    // Back-end: decision-switched Costas + Massey 2T combine + soft differential
+    // decode, emitting BOTH parity interpretations (dec0, dec1). No sync word and
+    // no polarity decision are made here -- the sync correlator (which owns the
+    // protocol) resolves the 4-fold parity/polarity ambiguity downstream. The
+    // front-end (batch or fractional-tracked) supplies the tone correlations.
+    // This is what keeps the demodulator protocol-agnostic and reusable.
+    void combine(const std::vector<std::complex<double>>& Y1,
+                 const std::vector<std::complex<double>>& Y2,
+                 std::vector<double>& dec0, std::vector<double>& dec1) const {
+        size_t nsym = Y1.size();
+        dec0.assign(nsym, 0.0);  dec1.assign(nsym, 0.0);
+        if (nsym < 3) return;
+        // Decision-switched Costas (Hodgart form) -> de-rotated arms X, Yv.
+        // Runs once; it is parity-independent (operates on the dominant tone).
+        std::vector<double> X(nsym, 0.0), Yv(nsym, 0.0);
         {
             const double pll_a = 0.01, pll_b = 2e-4;
             double theta = 0.0, freq = 0.0;
             for (size_t k = 0; k < nsym; ++k) {
                 std::complex<double> rot(std::cos(theta), -std::sin(theta));
-                std::complex<double> y1 = Y1[k] * rot, y2 = Y2[k] * rot;
-                X[k]  = y1.imag();
-                Yv[k] = y2.imag();
+                std::complex<double> y1 = Y1[k]*rot, y2 = Y2[k]*rot;
+                X[k]  = y1.imag();  Yv[k] = y2.imag();
                 const std::complex<double>& act = (std::norm(y2) > std::norm(y1)) ? y2 : y1;
                 double m = std::abs(act) + 1e-9;
-                double err = -(act.real() * ((act.imag() < 0) ? -1.0 : 1.0)) / m;  // esign = -1
+                double err = -(act.real() * ((act.imag() < 0) ? -1.0 : 1.0)) / m;
                 freq  += pll_b * err;
                 theta += pll_a * err + freq;
             }
         }
-
-        // --- Massey optimum 2T combine (parallel-tone / VHDL form) ---
-        //   A(i)=X(i)+X(i+1);  B(i)=Yv(i)+Yv(i+1)
-        //   enc_soft(i)=A(i) - (-1)^(i+parity) B(i)   (antipodal over 2T)
-        //   dec_soft(i)=boxplus(enc(i),enc(i-1))       (soft differential decode)
-        // (-1)^n parity phase and overall polarity form a 4-fold ambiguity the
-        // 24-bit sync word resolves (as the HDL does via cclk + sync). Try all
-        // four; keep the one the sync word correlates with most strongly.
         auto boxplus = [](double a, double b) {
             double s = ((a < 0) != (b < 0)) ? -1.0 : 1.0;
             return s * std::min(std::fabs(a), std::fabs(b));
         };
-        double pat[SYNC_BITS];                       // matches SyncTracker pattern
-        for (size_t i = 0; i < SYNC_BITS; ++i) {
-            int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
-            pat[i] = (bit == 1) ? -1.0 : 1.0;
-        }
-
-        int best_parity = 0; double best_pol = 1.0, best_peak = -2.0;
-        std::vector<double> dec(nsym, 0.0);
         for (int parity = 0; parity < 2; ++parity) {
             std::vector<double> enc(nsym, 0.0);
             for (size_t i = 0; i + 1 < nsym; ++i) {
@@ -601,37 +671,24 @@ public:
                 double sgn = (((i + parity) & 1) == 0) ? 1.0 : -1.0;
                 enc[i] = A - sgn * B;
             }
+            std::vector<double>& dec = (parity == 0) ? dec0 : dec1;
             dec[0] = 0.0;
             for (size_t i = 1; i < nsym; ++i) dec[i] = boxplus(enc[i], enc[i-1]);
-            for (int pol = 0; pol < 2; ++pol) {
-                double s = pol ? -1.0 : 1.0, peak = -2.0;
-                for (size_t pos = 0; pos + SYNC_BITS <= nsym; ++pos) {
-                    double num = 0.0, den = 1e-9;
-                    for (size_t j = 0; j < SYNC_BITS; ++j) {
-                        double v = s * dec[pos + j];
-                        num += pat[j] * v;  den += std::fabs(v);
-                    }
-                    double c = num / den;
-                    if (c > peak) peak = c;
-                }
-                if (peak > best_peak) { best_peak = peak; best_parity = parity; best_pol = s; }
-            }
-        }
-
-        // rebuild the winning hypothesis and emit dec-domain soft (e2-e1 sign)
-        {
-            std::vector<double> enc(nsym, 0.0);
-            for (size_t i = 0; i + 1 < nsym; ++i) {
-                double A = X[i] + X[i+1], B = Yv[i] + Yv[i+1];
-                double sgn = (((i + best_parity) & 1) == 0) ? 1.0 : -1.0;
-                enc[i] = A - sgn * B;
-            }
-            soft_out.assign(nsym, 0.0);
-            for (size_t i = 1; i < nsym; ++i) soft_out[i] = best_pol * boxplus(enc[i], enc[i-1]);
         }
     }
-    double get_freq_offset() const { return freq_offset_; }
-    
+
+    static sample_t interp_lin(const sample_t* s, double idx, size_t len) {
+        // Cubic (Catmull-Rom) interpolation; the coherent 2T detector is more
+        // timing-sensitive than the non-coherent path, and cubic measurably
+        // out-performs linear here (validated in the offline model).
+        if (idx < 1) idx = 1;
+        if (idx >= (double)(len - 2)) idx = (double)(len - 3);
+        size_t i = (size_t)idx;
+        double f = idx - (double)i;
+        sample_t a = s[i-1], b = s[i], c = s[i+1], d = s[i+2];
+        return b + 0.5*f*(c - a + f*(2.0*a - 5.0*b + 4.0*c - d + f*(3.0*(b - c) + d - a)));
+    }
+
     // Set Costas loop bandwidth
     // Wider bandwidth: faster acquisition, more noise
     // Narrower bandwidth: better noise rejection, slower tracking
@@ -648,6 +705,14 @@ private:
     double freq_offset_;
     double pll_alpha_;          // set by set_pll_bandwidth(); demodulate() uses fixed gains
     double pll_beta_;
+
+    // Fractional-timing front-end state / parameters
+    static constexpr int MF_M = 12;     // matched-filter sub-sample FLOOR (adaptive: max(12, round(sps)))
+    double sps_nom_   = (double)SAMPLES_PER_SYMBOL;  // nominal samples/symbol (40 default)
+    double el_offset_ = 0.5;               // early-late spacing, samples
+    double ted_slope_ = 0.018;             // measured normalized TED gain (err / sample)
+    double alpha_t_   = 0.06;              // PI proportional gain (model-validated)
+    double beta_t_    = 0.0025;            // PI integral gain
 };
 
 //------------------------------------------------------------------------------
@@ -865,6 +930,35 @@ public:
     
     SyncState get_state() const { return state_; }
     int get_total_frames() const { return total_frames_; }
+
+    // Resolve the 4-fold parity/polarity ambiguity using the sync word, returning
+    // the single soft stream (polarity applied) that process()/FrameDecoder use.
+    // Valid because parity and polarity are global constants for the stream. This
+    // is where the protocol's sync knowledge lives -- NOT in the demodulator, so
+    // the demod stays reusable under a different framing.
+    static std::vector<double> resolve(const std::vector<double>& dec0,
+                                       const std::vector<double>& dec1) {
+        double pat[SYNC_BITS];
+        for (size_t i = 0; i < SYNC_BITS; ++i) {
+            int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
+            pat[i] = (bit == 1) ? -1.0 : +1.0;
+        }
+        const std::vector<double>* str[2] = { &dec0, &dec1 };
+        double best = -1.0; int bp = 0; double bs = 1.0;
+        for (int p = 0; p < 2; ++p) {
+            const std::vector<double>& d = *str[p];
+            if (d.size() < SYNC_BITS) continue;
+            for (size_t pos = 0; pos + SYNC_BITS <= d.size(); ++pos) {
+                double sum = 0.0, en = 1e-9;
+                for (size_t j = 0; j < SYNC_BITS; ++j) { double v = d[pos+j]; sum += pat[j]*v; en += std::fabs(v); }
+                double c = sum / en;                       // normalized; sign = polarity
+                if (std::fabs(c) > best) { best = std::fabs(c); bp = p; bs = (c < 0) ? -1.0 : 1.0; }
+            }
+        }
+        std::vector<double> out = *str[bp];
+        if (bs < 0) for (double& x : out) x = -x;
+        return out;
+    }
 
 private:
     // Soft correlation: returns normalized correlation (-1 to +1)

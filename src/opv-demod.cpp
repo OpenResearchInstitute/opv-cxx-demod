@@ -71,12 +71,14 @@ int main(int argc, char* argv[]) {
     double pll_bw = 50.0;  // PLL bandwidth in Hz
     double init_offset = 0.0;  // Initial frequency offset for streaming mode
     bool have_init_offset = false;
+    double chan_rate = 0.0;    // >0: channelized sample rate -> fractional-timing coherent front-end
     
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-q")) quiet = true;
         else if (!strcmp(argv[i], "-r")) raw = true;
         else if (!strcmp(argv[i], "-c")) coherent = true;
         else if (!strcmp(argv[i], "-s")) streaming = true;
+        else if (!strcmp(argv[i], "-R") && i + 1 < argc) chan_rate = atof(argv[++i]);
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) afc_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pll_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
@@ -237,19 +239,33 @@ int main(int argc, char* argv[]) {
     if (coherent) {
         // Coherent demodulation with Costas loop
         CoherentMSKDemodulator demod;
-        
-        double est_offset = demod.estimate_offset(samples.data(), samples.size());
+        bool ch = (chan_rate > 0.0);
+        if (ch) demod.set_nominal_sps(chan_rate / SYMBOL_RATE);
+
+        // de Buda coarse acquisition is scaled to the native 2.168 Msps capture;
+        // for a channelized-rate loopback we run at baseband (offset 0).
+        double est_offset = ch ? 0.0 : demod.estimate_offset(samples.data(), samples.size());
         demod.set_freq_offset(est_offset);
-        
-        if (!quiet)
-            fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
-        
+
+        if (!quiet) {
+            if (ch) fprintf(stderr, "Channel rate: %.0f Hz (%.4f sps), offset assumed 0\n",
+                            chan_rate, chan_rate / SYMBOL_RATE);
+            else    fprintf(stderr, "Estimated carrier offset: %.1f Hz\n", est_offset);
+        }
+
         demod.set_pll_bandwidth(pll_bw);
-        
-        if (!quiet)
+
+        if (!quiet && !ch)
             fprintf(stderr, "PLL bandwidth: %.1f Hz\n", pll_bw);
-        
-        demod.demodulate(samples.data(), samples.size(), soft);
+
+        // Protocol-agnostic demod: it emits BOTH parity streams; the sync
+        // correlator (resolve) picks parity/polarity using the sync word.
+        std::vector<std::complex<double>> Y1, Y2;
+        if (ch) demod.track_correlations(samples.data(), samples.size(), Y1, Y2);
+        else    demod.batch_correlations(samples.data(), samples.size(), Y1, Y2);
+        std::vector<double> dec0, dec1;
+        demod.combine(Y1, Y2, dec0, dec1);
+        soft = SyncTracker::resolve(dec0, dec1);
         final_offset = demod.get_freq_offset();
     } else {
         // Non-coherent energy detection (original)
