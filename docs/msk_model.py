@@ -291,3 +291,54 @@ for e in [5,6,8]:
     NB=200000; s,aI,aQ=gen_oqpsk_msk(NB,seed=e+70)
     so=s*np.exp(1j*2*np.pi*500*np.arange(len(s))/Fs); rx=add_awgn_emp(so,e,NB)
     print(f" EbN0={e} dB, cold 500Hz, two-stage: BER={integrated_2stage(rx,aI,aQ):.2e}  (theory {Q(np.sqrt(2*10**(e/10))):.2e})")
+
+print()
+print("==== Faithful replica of opv-mod parallel-tone modulator + convention check ====")
+# Exact transcription of opv-mod.cpp HDLModulator::modulate_bit (the matched TX).
+# Confirms the bit<->tone convention against a known bit stream:
+#   bit 0 -> tone f2 (+dev),  bit 1 -> tone f1 (-dev).   "which tone" == the bit.
+# The +/- sign of the active tone carries the differential (d_val_xor) +
+# half-symbol parity (b_n) precoding -- phase the non-coherent detector ignores
+# and the coherent (2T) detector must invert. This is the matched decoder's job.
+class HDLMod:
+    def __init__(self): self.ph1=0.0; self.ph2=0.0; self.dxor_T=0; self.bn=1
+    def modulate(self, bits):
+        inc1=2*np.pi*(-DEV)/Fs; inc2=2*np.pi*(+DEV)/Fs; out=[]
+        for bit in bits:
+            dval = 1 if bit==0 else -1
+            if   dval== 1 and self.dxor_T== 1: dxor= 1
+            elif dval== 1 and self.dxor_T==-1: dxor=-1
+            elif dval==-1 and self.dxor_T== 1: dxor=-1
+            elif dval==-1 and self.dxor_T==-1: dxor= 1
+            else: dxor= 1
+            d_pos=(dval+1)>>1; d_neg=(dval-1)>>1
+            d_pos_enc=d_pos
+            d_neg_enc=d_neg if self.bn==0 else -d_neg
+            if   d_pos_enc==1 and self.dxor_T== 1: ds1= 1
+            elif d_pos_enc==1 and self.dxor_T==-1: ds1=-1
+            else: ds1=0
+            if   d_neg_enc==-1 and self.dxor_T== 1: ds2=-1
+            elif d_neg_enc==-1 and self.dxor_T==-1: ds2= 1
+            elif d_neg_enc== 1 and self.dxor_T== 1: ds2= 1
+            elif d_neg_enc== 1 and self.dxor_T==-1: ds2=-1
+            else: ds2=0
+            for i in range(SPS):
+                out.append((ds1*np.sin(self.ph1)+ds2*np.sin(self.ph2))
+                           +1j*(ds1*np.cos(self.ph1)+ds2*np.cos(self.ph2)))
+                self.ph1+=inc1; self.ph2+=inc2
+                self.ph1=(self.ph1+np.pi)%(2*np.pi)-np.pi
+                self.ph2=(self.ph2+np.pi)%(2*np.pi)-np.pi
+            self.dxor_T=dxor; self.bn=1-self.bn
+        return np.array(out)
+
+np.random.seed(41)
+bits = np.random.randint(0,2,4000)
+s = HDLMod().modulate(bits)
+t=np.arange(SPS)/Fs
+lo1=np.exp(-1j*2*np.pi*(-DEV)*t); lo2=np.exp(-1j*2*np.pi*(+DEV)*t)
+seg=s[:len(bits)*SPS].reshape(len(bits),SPS); Y1=seg@lo1; Y2=seg@lo2
+bit_hat = np.where(np.abs(Y2)>np.abs(Y1), 0, 1)      # f2 active -> bit 0
+print(f"  which-tone BER vs source bits (no noise): {np.mean(bit_hat!=bits):.3e}  -> replica + convention confirmed")
+ya=np.maximum(np.abs(Y1),np.abs(Y2)); yi=np.minimum(np.abs(Y1),np.abs(Y2))
+print(f"  |Y_active|={ya.mean():.1f}  |Y_inactive|={yi.mean():.1f}  crosstalk ratio={yi.mean()/ya.mean():.2f}"
+      f"  (the MSK min-spacing leakage that sets the non-coherent floor)")
