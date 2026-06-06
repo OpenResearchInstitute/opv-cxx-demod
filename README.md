@@ -1,383 +1,357 @@
 # OPV Modem
 
-**Opulent Voice Protocol** - A digital voice protocol for amateur radio.
+**Opulent Voice Protocol** — a digital voice protocol for amateur radio.
 
-Self-contained C++ implementations of the OPV modulator and demodulator, designed for use with PlutoSDR/LibreSDR hardware and Interlocutor.
+Self-contained C++ implementations of the OPV modulator and demodulator. The
+same DSP runs three ways, all sharing the *exact* over-the-air format:
 
-### Two ways to use this code
-
-1. **As standalone programs** (the original and primary use) — build with `make`
-   and run `opv-mod`, `opv-demod`, and `opv-modem` exactly as documented below.
-   Nothing here has changed: same commands, same behaviour, same PlutoSDR and
-   Interlocutor integration.
-
-2. **As a header-only library** — the receive DSP lives in `src/opv_demod.hpp`,
-   so another C++ design can embed the OPV demodulator directly. (For example, the
-   Haifuraiya satellite payload runs many demodulator instances across the
-   channelizer outputs instead of launching one program per channel.) See
+1. **Standalone programs on PlutoSDR/LibreSDR** (the original and primary use) —
+   build with `make`, run `opv-mod` / `opv-demod` / `opv-modem`. See
+   [Quick Start](#quick-start).
+2. **As a header-only library / git submodule** — the receive DSP lives in one
+   header, `src/opv_demod.hpp`, so another C++ design can embed it. See
    [Using OPV as a Library](#using-opv-as-a-library-header-only).
+3. **Channelized, on the Haifuraiya satellite payload** — many demodulator
+   instances run across the channelizer's per-channel outputs at the native
+   channel rate, on the ZCU102 A53 cores under dogu. See
+   [Running it in Haifuraiya (dogu)](#running-it-in-haifuraiya-dogu).
 
-Both modes share the *exact same DSP code*, so the over-the-air format is
-identical no matter which way you use it.
+If you are bringing this to **another system or protocol**, the section
+[Adapting to other waveforms](#adapting-to-other-waveforms-the-levers) lays out
+the three layers you change — waveform, framing, FEC — and what you keep.
+
+---
 
 ## Quick Start
 
 ```bash
-# Build
-make
-
-# Loopback test
-make test
-
-# Full transceiver with Interlocutor
-./opv-pluto.sh -f 435000000 -v
+make                                # build all binaries into bin/
+make test                           # loopback self-test
+./opv-pluto.sh -f 435000000 -v      # full transceiver with Interlocutor (PlutoSDR)
 ```
+
+`make` now builds four programs: `opv-mod`, `opv-demod`, `opv-modem`, and
+`opv-resample`.
 
 ## Signal Parameters
 
-| Parameter | Value |
-|-----------|-------|
-| Modulation | MSK (Minimum Shift Keying) |
-| Symbol Rate | 54,200 baud |
-| Sample Rate | 2,168,000 SPS |
-| Frequency Deviation | ±13,550 Hz |
-| Samples/Symbol | 40 |
+| Parameter | Value | Lever |
+|-----------|-------|-------|
+| Modulation | MSK (Minimum Shift Keying, h = 0.5) | waveform |
+| Symbol Rate | 54,200 baud | waveform |
+| Frequency Deviation | ±13,550 Hz | waveform |
+| Native Sample Rate | 2,168,000 SPS | waveform |
+| Samples/Symbol (native) | 40 | waveform (see `-R` / `set_nominal_sps()` to run at any rate) |
 
 ## Frame Structure
 
-| Field | Size | Description |
-|-------|------|-------------|
-| Sync Word | 24 bits | 0x02B8DB |
-| Encoded Payload | 2144 bits | Rate 1/2 convolutionally coded |
-| **Total** | **2168 symbols** | ~40 ms per frame |
+| Field | Size | Description | Lever |
+|-------|------|-------------|-------|
+| Sync Word | 24 bits | 0x02B8DB | framing |
+| Encoded Payload | 2144 bits | Rate 1/2 convolutionally coded | FEC |
+| **Total** | **2168 symbols** | ~40 ms per frame | framing |
 
 ### Payload (134 bytes before encoding)
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0-5 | 6 bytes | Station ID (Base-40 encoded) |
-| 6-8 | 3 bytes | Token |
-| 9-11 | 3 bytes | Reserved |
-| 12-133 | 122 bytes | Voice/Data payload |
+| 0–5 | 6 bytes | Station ID (Base-40 encoded) |
+| 6–8 | 3 bytes | Token |
+| 9–11 | 3 bytes | Reserved |
+| 12–133 | 122 bytes | Voice/Data payload |
 
 ## Channel Coding
 
-- **Convolutional Code**: Rate 1/2, K=7
-  - G1 = 0x4F (171 octal)
-  - G2 = 0x6D (133 octal)
+- **Convolutional Code**: Rate 1/2, K=7 (G1 = 0x4F, G2 = 0x6D)
 - **Interleaver**: 67×32 block with bit reversal
-- **Randomizer**: CCSDS 8-bit LFSR (polynomial x⁸+x⁷+x⁵+x³+1)
+- **Randomizer**: CCSDS 8-bit LFSR (x⁸+x⁷+x⁵+x³+1)
+
+---
 
 ## Programs
 
-### opv-pluto.sh - PlutoSDR Transceiver
+### opv-pluto.sh — PlutoSDR Transceiver
 
-Full-duplex transceiver for use with Interlocutor. One script, just like Dialogus.
+Full-duplex transceiver for use with Interlocutor (one script, like Dialogus).
 
 ```bash
 ./opv-pluto.sh                              # 435 MHz simplex (default)
 ./opv-pluto.sh -f 905050000                 # 905.05 MHz
-./opv-pluto.sh -f 144390000 -v              # 2m band, verbose
-./opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # Split operation
-./opv-pluto.sh -u ip:192.168.3.1            # Custom Pluto IP
+./opv-pluto.sh --tx-freq 435000000 --rx-freq 440000000  # split operation
+./opv-pluto.sh -u ip:192.168.3.1            # custom Pluto IP
 ```
 
-**Workflow:**
-1. Start `./opv-pluto.sh`
-2. Start Interlocutor (TX to UDP 57372, listen on UDP 57373)
-3. Use Interlocutor to send messages and make calls
-
-**Port Configuration Note:**
-
-Dialogus (running on the Pluto itself) uses port 57372 for both directions because Interlocutor and Dialogus are on different IP addresses. When running opv-modem on the same computer as Interlocutor, we need separate ports to avoid conflicts:
-
-| Direction | Port | Description |
-|-----------|------|-------------|
-| Interlocutor → opv-modem | 57372 | Frames to transmit |
-| opv-modem → Interlocutor | 57373 | Received frames |
-
-Configure Interlocutor with: TX port = 57372, RX port = 57373
-
-**Options:**
 | Option | Description |
 |--------|-------------|
 | `-f, --frequency` | Simplex frequency in Hz |
-| `--tx-freq` | TX frequency (split operation) |
-| `--rx-freq` | RX frequency (split operation) |
-| `--tx-gain` | TX gain in dB (default: -20) |
-| `--rx-gain` | RX gain in dB (default: 40) |
-| `--tx-port` | UDP port from Interlocutor (default: 57372) |
-| `--rx-port` | UDP port to Interlocutor (default: 57373) |
-| `-u, --uri` | PlutoSDR URI (default: ip:192.168.2.1) |
-| `-v` | Verbose output |
+| `--tx-freq` / `--rx-freq` | Split operation |
+| `--tx-gain` / `--rx-gain` | dB (defaults −20 / 40) |
+| `--tx-port` / `--rx-port` | UDP ports to/from Interlocutor (57372 / 57373) |
+| `-u, --uri` | PlutoSDR URI (default ip:192.168.2.1) |
+| `-v` | Verbose |
 
-### opv-modem - Modem Server
+Interlocutor config: TX port = 57372, RX port = 57373.
 
-UDP server for Interlocutor integration. Used internally by opv-pluto.sh.
+### opv-modem — Modem Server
 
-```
-Usage: bin/opv-modem [OPTIONS]
-
-Modes:
-  -l          Loopback: UDP → mod → demod → UDP (testing)
-  -t          TX mode: UDP → mod → stdout (to PlutoSDR)
-  -R          RX mode: stdin → demod → UDP (from PlutoSDR)
-
-Options:
-  -p PORT     UDP port to listen on (default: 57372)
-  -r PORT     UDP port to send to (default: 57373)
-  -c CALL     Rewrite callsign (loopback repeater mode)
-  -d PATH     Path to opv-demod (default: ./bin/opv-demod)
-  -v          Verbose output
-```
-
-### opv-mod - Modulator
+UDP server for Interlocutor (used internally by opv-pluto.sh).
 
 ```
-Usage: bin/opv-mod -S CALLSIGN -B FRAMES [-t TOKEN] [-c] [-v]
-
-Options:
-  -S CALLSIGN   Station callsign (e.g., W5NYV, KB5MU)
-  -B FRAMES     Number of frames to transmit
-  -R            Raw mode (read 134-byte frames from stdin)
-  -t TOKEN      24-bit token (default: 0xBBAADD)
-  -c            Continuous mode (loop forever)
-  -v            Verbose output
-
-Output: 16-bit I/Q samples (little-endian) to stdout
+-l   Loopback: UDP → mod → demod → UDP        -p PORT  listen port (57372)
+-t   TX:       UDP → mod → stdout (to radio)  -r PORT  send port   (57373)
+-R   RX:       stdin (from radio) → demod → UDP
 ```
 
-### opv-demod - Demodulator
+### opv-mod — Modulator
+
+```
+Usage: bin/opv-mod -S CALLSIGN -B FRAMES [-P] [-t TOKEN] [-c] [-v]
+  -S CALLSIGN   Station callsign           -P  prepend one preamble frame
+  -B FRAMES     Number of BERT frames      -t  24-bit token (default 0xBBAADD)
+  -R            Raw mode (134-byte frames from stdin)
+  -c            Continuous (loop forever)  -v  verbose
+Output: 16-bit I/Q (little-endian, interleaved) to stdout, at 2.168 Msps.
+```
+
+### opv-demod — Demodulator
 
 ```
 Usage: bin/opv-demod [options] < input.iq
-
-Options:
-  -s            Streaming mode (real-time from radio)
+  -c            Coherent mode (Costas + 2T detector; ~6 dB through the FEC)
+  -R <rate>     Channelized input rate in Hz -> fractional-timing front-end
+                (e.g. -R 625000 for a 625 ksps channel; coherent only)
+  -s            Streaming mode (real-time from radio; non-coherent today)
   -r            Raw output (134-byte frames to stdout)
-  -c            Coherent mode (Costas loop, ~3dB SNR improvement)
-  -p <hz>       PLL bandwidth in Hz (default: 50, coherent mode only)
-  -a <bw>       AFC bandwidth alpha (default: 0.001)
-  -o <hz>       Initial frequency offset in Hz (streaming mode)
-  -q            Quiet mode (suppress all stderr output)
-
-Input: 16-bit I/Q samples (little-endian) from stdin
-
-Features:
-  - Automatic Frequency Control (AFC)
-  - Symbol Timing Recovery (early-late gate timing error detector)
-  - Soft-decision Viterbi decoding
-  - Sync tracking with flywheel
-  - Optional coherent demodulation via 2nd-order Costas loop
+  -p <hz>       PLL bandwidth (default 50, coherent only)
+  -a <bw>       AFC bandwidth alpha (default 0.001, non-coherent)
+  -o <hz>       Initial frequency offset (streaming)
+  -q            Quiet
+Input: 16-bit I/Q (little-endian, interleaved) from stdin.
 ```
 
-**Minimum burst length:** The sync state machine requires two frames to acquire
-lock (HUNTING → VERIFYING → LOCKED), so the first frame of any transmission is
-always consumed by acquisition. A burst of N frames will produce N-1 decoded
-frames at the receiver. For PTT-style operation, transmit at least 3 frames to
-guarantee one decoded frame at the far end. The preamble frames sent by
-`opv-modem` and `opv-pluto.sh` exist partly to allow the demodulator to acquire
-symbol timing before the first data frame arrives, but frame sync still requires
-two data frames to confirm.
+Without `-R`, the coherent path processes at the native 2.168 Msps (40 sps,
+fixed integer windows). With `-R <rate>` it sets the nominal samples/symbol to
+`rate / 54200` and runs the fractional-timing front-end — this is how a single
+demod handles whatever rate the radio actually delivers (e.g. a channelizer's
+~11.53 sps) without resampling the receive path.
 
-**Coherent mode note:** The `-c` flag enables a 2nd-order Costas loop for
-continuous carrier phase tracking, yielding a theoretical 3 dB SNR improvement
-over non-coherent detection. In synthetic loopback tests both modes perform
-identically due to the steep FEC waterfall masking the coherent gain. The
-advantage becomes meaningful under real hardware conditions — oscillator drift,
-phase noise, and dynamic Doppler on a live satellite pass. Use
-`make test-doppler FREQ_MHZ=<band>` to characterize Doppler performance for
-your operating frequency.
+### opv-resample — Fractional-rate I/Q resampler
 
-## Standalone PlutoSDR Scripts
+A standalone Unix pipe filter (its own program — not part of the modulator).
+opv-mod is unchanged; you insert opv-resample between stages when you need a
+different sample rate.
 
-For use without Interlocutor (BERT testing, debugging).
+```
+Usage: bin/opv-resample [Fin Fout [K]]      (defaults 2168000 625000 32)
+  Fin, Fout   input/output sample rates in Hz
+  K           windowed-sinc half-width in taps (default 32; raise for sharper
+              anti-aliasing on large decimation ratios)
+Reads/writes 16-bit I/Q (little-endian, interleaved) on stdin/stdout.
+```
 
-### Receive: opv-pluto-rx.sh
+Two uses: (1) make channel-rate frames for a simulated loopback, and (2) as the
+SIC reference-reconstruction step (bring a reconstructed signal to the working
+rate before subtraction).
+
+---
+
+## Coherent demodulation (status and how to use it)
+
+Coherent detection (the `-c` flag) uses a decision-switched Costas loop feeding
+the Massey optimum 2T detector, with soft-differential decode. Measured through
+the real rate-1/2 K=7 Viterbi/FEC in batch A/B testing, it gives roughly **6 dB**
+over non-coherent — two stacked ~3 dB wins, coherent-vs-non-coherent and
+antipodal-(2T)-vs-orthogonal-(per-symbol). The earlier "≈3 dB, masked in
+loopback" note described a since-replaced simple per-symbol detector; the 2T
+detector's gain is real and shows in batch comparison at the operating SNR.
+
+Two honest caveats:
+
+- **Batch vs live.** The `-c` coherent path is currently a *batch* (whole-capture)
+  decode, including `-R` channelized operation. The *streaming* path (`-s`) is
+  non-coherent today. Live coherent — running the coherent front-end causally
+  inside `ChannelReceiver` — is in progress; the front-end is now causal-ready
+  (forward timing loop, forward Costas, resolve-once parity/polarity), which was
+  the blocker. The intent is for coherent to become the default and non-coherent
+  to be retired once live coherent is proven on the bench.
+- **Loop tuning is a bench activity.** The fractional timing loop functions in
+  simulation and is bounded (anti-windup), but its bandwidth and lock thresholds
+  are finalized against a real link, not synthetic drift.
+
+### Channel-rate loopback (simulated)
+
+Real FEC frames, resampled to a 625 ksps channel, decoded by the coherent
+fractional front-end at ~11.53 samples/symbol:
 
 ```bash
-scripts/opv-pluto-rx.sh                      # Receive until Ctrl+C
-scripts/opv-pluto-rx.sh -t 10                # Receive for 10 seconds
-scripts/opv-pluto-rx.sh -f 905036750 -g 50   # Custom frequency and gain
-scripts/opv-pluto-rx.sh -o capture.iq        # Save raw IQ for debugging
+opv-mod -S W5NYV -P -B 20 | opv-resample 2168000 625000 | opv-demod -c -R 625000
 ```
 
-### Transmit: opv-pluto-tx.sh
+The same pipe at the native rate is just `opv-mod ... | opv-demod -c` (no resampler,
+no `-R`).
 
-```bash
-scripts/opv-pluto-tx.sh -S W5NYV -B 10       # Send 10 BERT frames
-scripts/opv-pluto-tx.sh -S W5NYV -B 10 -c    # Continuous BERT (Ctrl+C to stop)
-scripts/opv-pluto-tx.sh -S W5NYV -g -10      # Adjust TX gain
-```
+---
 
-Requires `iio_attr` and `iio_rwdev` (libiio-utils).
+## Adapting to other waveforms (the levers)
+
+The receive chain is deliberately split so the **demodulator is protocol-agnostic
+and reusable**. It contains no sync word and no frame knowledge — it turns samples
+into soft symbols, emitting *both* differential-parity interpretations. Everything
+protocol-specific lives downstream. To retarget another system you change one or
+more of three layers and keep the rest:
+
+**1. Waveform layer** — `SYMBOL_RATE`, `FREQ_DEV` (h = 0.5 MSK), and the running
+sample rate. The rate is not baked in: `CoherentMSKDemodulator::set_nominal_sps()`
+(or `-R` on the program) lets one demod run at any samples/symbol, integer or not,
+via fractional timing. Change these for a different baud or deviation.
+
+**2. Framing layer** — `SYNC_WORD`, `SYNC_BITS`, `FRAME_SYMBOLS`, and
+`SyncTracker`. This is where sync detection and the four-fold parity/polarity
+resolution live (`SyncTracker::resolve()`), entirely outside the demod. Swap the
+sync correlator for a different preamble/framing and the demod is untouched.
+
+**3. FEC layer** — the convolutional code, interleaver, and randomizer in
+`FrameDecoder` (and the matching encoder in `opv-mod`). Swap these for a different
+code and keep the demod and sync layers.
+
+The boundary is enforced by the data flow: `demod → (dec0, dec1) →
+SyncTracker::resolve → SyncTracker → FrameDecoder`. The demod never references the
+sync word; the sync correlator owns the protocol.
+
+---
 
 ## Using OPV as a Library (header-only)
 
-The OPV *receive* DSP — the MSK demodulators, symbol-lock detector, sync tracker,
-Viterbi decoder, and frame decoder — lives in a single header, `src/opv_demod.hpp`.
-The `opv-demod` program is now a thin shell that `#include`s that header and adds
-the command-line/streaming harness around it. **The program behaves exactly as it
-did before** (verified byte-for-byte against the previous single-file version);
-the header simply makes the same DSP reusable by other designs.
-
-Header-only means there is nothing extra to build or link — you include one file.
-This keeps the repo's self-contained, dependency-free character intact.
-
-### Adding it to your project
-
-As a git submodule:
+The receive DSP — demodulators, symbol-lock detector, sync tracker, Viterbi, and
+frame decoder — is a single header, `src/opv_demod.hpp`. Header-only: include one
+file, nothing to link.
 
 ```bash
 git submodule add https://github.com/OpenResearchInstitute/opv-cxx-demod.git extern/opv
+# then compile your code with -Iextern/opv/src
 ```
-
-Then put `src/` on your include path and include the header:
-
 ```cpp
-#include "opv_demod.hpp"   // compile with -Iextern/opv/src
+#include "opv_demod.hpp"
 ```
 
-### The API
+### The classes you drive
 
-The header exposes the OPV receive chain as classes you instantiate and drive.
-One set of these objects represents one receive channel; a multi-channel design
-holds many independent instances and feeds each one blocks of complex baseband.
+| Class | Role | Key methods |
+|-------|------|-------------|
+| `ChannelReceiver` | High-level **non-coherent** receive chain for one channel (demod + lock + sync + FEC). Feed IQ blocks, get frames. | `process(samples, n, on_frame)`, `set_freq_offset()`, `estimate_offset()` |
+| `MSKDemodulatorAFC` | Non-coherent MSK demod, AFC + early-late timing | `demodulate(samples, n, soft_out)` |
+| `CoherentMSKDemodulator` | Coherent (Costas + 2T) front-end, protocol-agnostic | `batch_correlations()` (native rate) / `track_correlations()` (fractional, set via `set_nominal_sps()`), then `combine(Y1,Y2,dec0,dec1)` → both parity streams |
+| `SyncTracker` | Frame sync + parity/polarity resolution | `resolve(dec0,dec1)` → resolved soft; `process(soft, idx)`; `get_state()` |
+| `ViterbiDecoder` / `FrameDecoder` | Soft-decision FEC + frame extraction | `decode(soft, out)` |
+| `decode_base40()` | Decode a Base-40 Station ID | free function |
 
-| Class | Role | Key methods / accessors |
-|-------|------|--------------------------|
-| **`ChannelReceiver`** | **High-level: one channel's full receive chain (demod + symbol lock + sync + FEC). Feed it IQ blocks, get decoded frames.** | **`process(samples, n, on_frame)`, `process(samples, n) → vector<Frame>`, `set_freq_offset()`, `estimate_offset()`, `sync_state()`, `total_symbols()`** |
-| `MSKDemodulatorAFC` | Non-coherent MSK demod with AFC + early-late timing recovery | `demodulate(samples, n, soft_out)`, `set_freq_offset()`, `get_freq_offset()`, `set_tracking_enabled()`, `set_afc_bandwidth()` |
-| `CoherentMSKDemodulator` | Coherent (Costas-loop) variant, ~3 dB SNR gain | same `demodulate()` shape |
-| `SymbolLockDetector` | Gates frame-sync search until symbol timing converges | — |
-| `SyncTracker` | Frame sync state machine (HUNTING → VERIFYING → LOCKED) | `get_state()` |
-| `ViterbiDecoder` / `FrameDecoder` | Soft-decision FEC + frame extraction | — |
-| `decode_base40()` | Decode a Base-40 Station ID field | free function |
+`sample_t` is `std::complex<double>`; IQ blocks are `const sample_t*` + length;
+soft symbols come back as `std::vector<double>`.
 
-Most consumers want **`ChannelReceiver`** — it owns the whole chain and hands
-back decoded frames. The lower-level classes are exposed for hosts that need to
-wire a custom orchestration.
+**Coherent in a host:** instantiate `CoherentMSKDemodulator`, run
+`track_correlations()` (or `batch_correlations()`), `combine()` to get the two
+parity streams, `SyncTracker::resolve()` to pick parity/polarity, then drive
+`SyncTracker::process()` and `FrameDecoder::decode()`. (This is exactly what the
+program's `-c` path does — see `src/opv-demod.cpp`.) `ChannelReceiver` itself is
+the non-coherent live chain today; the coherent live wrapper is the in-progress
+work noted above.
 
-The sample type is `sample_t` (`std::complex<double>`); IQ blocks are passed as a
-`const sample_t*` plus length, and soft symbol decisions come back as a
-`std::vector<double>`.
+A minimal non-coherent example is in
+[`examples/use_as_library.cpp`](examples/use_as_library.cpp).
 
-### Minimal example
+---
 
-A complete, compilable example lives in [`examples/use_as_library.cpp`](examples/use_as_library.cpp):
+## Running it in Haifuraiya (dogu)
+
+Haifuraiya's receiver is a 64-channel polyphase channelizer on a ZCU102. Each
+channel can carry an Opulent Voice signal, and each needs its own demod+decode at
+the **per-channel rate** — about **625 ksps**, i.e. ~11.53 samples/symbol (54200
+baud does not divide the radio's 2.168 Msps cleanly, which is why the demod runs
+fractional timing rather than resampling the receive path). One demod instance per
+channel; up to 64 in parallel across the four A53 cores.
+
+**Build for the A53:**
+
+```bash
+make TARGET=a53     # aarch64, cortex-a53
+# PetaLinux SDK:  make TARGET=a53 CXX=aarch64-xilinx-linux-g++ SYSROOT=<sdk-sysroot>
+```
+
+**As a submodule in dogu:** add this repo as a submodule, put `src/` on the
+include path, and hold one receiver per channel. Set the channel rate once:
 
 ```cpp
 #include "opv_demod.hpp"
-
-ChannelReceiver rx;                 // one instance per channel
-rx.set_freq_offset(0.0);           // or rx.estimate_offset(block, n) on first block
-
-std::vector<sample_t> block(/* IQ samples */);
-rx.process(block.data(), block.size(),
-           [](const ChannelReceiver::Frame& f) {
-               // delivered the instant a frame completes:
-               // f.bytes (134 B), f.metric (0 = perfect), f.sync_quality
-           });
+CoherentMSKDemodulator demod;
+demod.set_nominal_sps(625000.0 / 54200.0);   // ~11.53 — the only rate lever
+// per block: track_correlations -> combine -> SyncTracker::resolve -> SyncTracker -> FrameDecoder
 ```
 
-Build it:
+opv-cxx-demod is dependency-light (libstdc++/libm/libc; complex baseband in, soft
+symbols out — no Xilinx/ADI deps), so it drops into the dogu build the way dogu's
+own artifacts do.
 
-```bash
-g++ -std=c++17 -O3 -Isrc examples/use_as_library.cpp -o use_as_library
+**dogu side (the radio).** dogu brings the channelizer up and exposes the DMA
+path from the ADRV9002:
+
+```sh
+/home/root/bring-up.sh tes_0231_Haifuraiya_FDD_LVDS_20Msps_10MHz   # profile load, LO retune, calibrations, channelizer enable
+/home/root/dma_listen -n 4096                                      # ARM userspace <-> channelizer DMA
 ```
 
-### Note on orchestration
+`dma_listen` reads the channelizer DMA as 16-bit I/Q. Routing a given channel's
+~625 ksps stream into a demod instance (program via `-R 625000`, or library via
+`set_nominal_sps`) is the dogu-side integration and is finalized on the bench
+against the live channelizer output. For a quick **simulated** check of the exact
+channel-rate decode the payload will do, use the loopback pipe shown above.
 
-`ChannelReceiver` *is* the orchestration: it owns the demod → symbol lock → sync
-tracker → Viterbi → frame decoder chain and the streaming bookkeeping, and emits
-each decoded frame through your callback the moment it completes (or into a
-`vector` via the convenience overload). A multi-channel host such as dogu holds
-one `ChannelReceiver` per channel and schedules blocks across them; the I/O
-source and cross-channel scheduling stay host-specific, while the per-channel
-chain is shared.
-
-Crucially, the standalone `opv-demod` program's streaming mode is built on the
-very same `ChannelReceiver` — so the loopback, coherent, and Doppler tests in
-this repo exercise the exact code a host reuses. (The callback form delivers
-frames inline, byte-for-byte preserving the original streaming output.)
+---
 
 ## Directory Structure
 
 ```
 opv-cxx-demod/
-├── Makefile              # Build system
-├── README.md             # This file
+├── Makefile              # builds opv-mod, opv-demod, opv-modem, opv-resample
+├── README.md
 ├── LICENSE               # CERN-OHL-S-2.0
-├── opv-pluto.sh          # Full transceiver script
-├── bin/                  # Built binaries (created by make)
-│   ├── opv-mod
-│   ├── opv-demod
-│   └── opv-modem
+├── opv-pluto.sh
+├── bin/                  # built binaries (make)
 ├── src/
-│   ├── opv-mod.cpp       # Modulator program (self-contained)
-│   ├── opv-demod.cpp     # Demodulator program — thin shell over opv_demod.hpp
-│   ├── opv_demod.hpp     # Demodulator DSP core (header-only library)
-│   └── opv-modem.cpp     # Modem server (self-contained)
-├── examples/
-│   └── use_as_library.cpp  # Minimal header-only library usage example
-├── scripts/
-│   ├── opv-pluto-rx.sh   # Standalone RX script
-│   └── opv-pluto-tx.sh   # Standalone TX script
+│   ├── opv-mod.cpp       # modulator (self-contained, unchanged)
+│   ├── opv-demod.cpp     # demodulator program — thin shell over opv_demod.hpp
+│   ├── opv_demod.hpp     # receive DSP core (header-only library)
+│   ├── opv-modem.cpp     # modem server (self-contained)
+│   └── opv-resample.cpp  # fractional-rate I/Q resampler (pipe filter)
+├── examples/use_as_library.cpp
+├── scripts/              # opv-pluto-rx.sh, opv-pluto-tx.sh
 └── docs/
-    ├── numerology.ipynb  # Design calculations
-    └── filter-taps.ipynb # Filter design
 ```
-
-## Interoperability
-
-- **Interlocutor**: Full integration via UDP (text messages, voice calls)
-- **Loopback**: Successfully modulates and demodulates to itself
-- **Demodulates**: LibreSDR HDL modem Locutus transmissions
-- **Modulation**: To Be Tested with LibreSDR HDL modem Locutus receiving
-- **Sample Format**: 16-bit signed I/Q, little-endian, interleaved
 
 ## Building
 
-Requirements:
-- C++17 compiler (g++ or clang++)
-- No external dependencies (self-contained)
-- libiio-utils for PlutoSDR scripts
-
 ```bash
-make            # Build all programs for the host (x86)
-make TARGET=pluto   # Cross-compile for PlutoSDR  (ARMv7-A Cortex-A9 + NEON)
-make TARGET=a53     # Cross-compile for Haifuraiya (ZCU102 A53, aarch64)
-make test       # Verify loopback works
-make test-raw   # Test raw frame mode
-make test-rx    # Test RX mode UDP output
-make test-coherent                             # Verify coherent mode decodes as many frames as non-coherent
-make test-coherent-compare                     # Compare coherent vs non-coherent, static offset + noise
-make test-coherent-compare SNR=-5 OFFSET=300  # Custom conditions
-make test-doppler                              # LEO Doppler stress test at 905 MHz (default)
-make test-doppler FREQ_MHZ=433                # 70cm band (±11.3 kHz swing, 220 Hz/sec)
-make test-doppler FREQ_MHZ=2400               # 2.4 GHz (±62.4 kHz swing, 1200 Hz/sec)
-make test-doppler FREQ_MHZ=5000               # 5 GHz uplink (±130 kHz swing, 2535 Hz/sec)
-make clean      # Remove binaries
+make                # host (x86), plus the test suite
+make TARGET=pluto   # PlutoSDR   (ARMv7-A Cortex-A9 + NEON)
+make TARGET=a53     # Haifuraiya (ZCU102 A53, aarch64)
+make test           # loopback
+make test-coherent  # coherent decodes as many frames as non-coherent
+make clean
 ```
 
-Doppler rate scales with carrier frequency (`f · v²/c·h` at zenith for 400 km LEO).
-LEO is the worst case: HEO only reaches LEO rates briefly at perigee, GEO drifts
-a few Hz/sec. Note that synthetic Doppler tests may show equal coherent/non-coherent
-performance due to the FEC waterfall masking the 3 dB coherent gain — true
-validation of the coherent advantage requires over-the-air testing on a live
-satellite pass with real oscillator drift.
+Requirements: a C++17 compiler, no external dependencies. The PlutoSDR scripts
+need libiio-utils.
+
+## Interoperability
+
+- **Interlocutor**: full UDP integration (text, voice).
+- **Demodulates**: LibreSDR HDL modem Locutus transmissions.
+- **Sample format**: 16-bit signed I/Q, little-endian, interleaved.
 
 ## License
 
-CERN Open Hardware License - Strongly Reciprocal (CERN-OHL-S-2.0)
+CERN Open Hardware License — Strongly Reciprocal (CERN-OHL-S-2.0)
 
 ## Credits
 
-Open Research Institute, Inc.  
-https://openresearch.institute
-
+Open Research Institute, Inc. — https://openresearch.institute
 Developed as part of the Phase 4 Ground project for amateur radio digital communications.
-
-## Thanks
-
-Thanks to [Rob Riggs of Mobilinkd LLC](https://github.com/mobilinkd) for the M17 implementation that originally inspired this codebase.
