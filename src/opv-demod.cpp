@@ -137,7 +137,6 @@ int main(int argc, char* argv[]) {
         if (have_init_offset) rx.set_freq_offset(init_offset);
 
         int decoded = 0, perfect = 0;
-        size_t total_samples = 0;
         auto emit = [&](const CoherentChannelReceiver::Frame& f) {
             decoded++;
             if (f.metric == 0) perfect++;
@@ -161,13 +160,11 @@ int main(int argc, char* argv[]) {
         while (std::cin.read(reinterpret_cast<char*>(&iq), sizeof(iq))) {
             chunk_buf.push_back(sample_t(iq.I, iq.Q));
             if (chunk_buf.size() >= CHUNK_SAMPLES) {
-                total_samples += chunk_buf.size();
                 rx.process(chunk_buf.data(), chunk_buf.size(), emit);
                 chunk_buf.clear();
             }
         }
         if (!chunk_buf.empty()) {
-            total_samples += chunk_buf.size();
             rx.process(chunk_buf.data(), chunk_buf.size(), emit);
         }
 
