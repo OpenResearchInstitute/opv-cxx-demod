@@ -119,6 +119,70 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     // STREAMING MODE - process data as it arrives
     // =========================================================================
+    if (streaming && coherent) {
+        // -------- LIVE COHERENT streaming path (sibling of the non-coherent one
+        // below; the proven non-coherent receiver is left entirely untouched).
+        // CoherentChannelReceiver buffers the leftover sample tail internally for
+        // symbol continuity, so the driver just feeds successive chunks. --------
+        if (!quiet)
+            fprintf(stderr, "Streaming mode (COHERENT): processing data as it arrives...\n\n");
+
+        CoherentChannelReceiver rx;
+        if (chan_rate > 0.0) {
+            rx.set_nominal_sps(chan_rate / SYMBOL_RATE);
+            if (!quiet)
+                fprintf(stderr, "Channel rate %.0f sps -> %.4f samples/symbol\n\n",
+                        chan_rate, chan_rate / SYMBOL_RATE);
+        }
+        if (have_init_offset) rx.set_freq_offset(init_offset);
+
+        int decoded = 0, perfect = 0;
+        size_t total_samples = 0;
+        auto emit = [&](const CoherentChannelReceiver::Frame& f) {
+            decoded++;
+            if (f.metric == 0) perfect++;
+            if (!quiet) {
+                fprintf(stderr, "[hyp %d] ", f.hypothesis);   // 0=dec0+ 1=dec0- 2=dec1+ 3=dec1-
+                print_frame(decoded, f.bytes, f.metric, f.sync_quality);
+            }
+            if (raw) {
+                std::cout.write(reinterpret_cast<const char*>(f.bytes.data()), FRAME_BYTES);
+                std::cout.flush();
+            }
+        };
+
+        // Realistic DMA-sized chunks; the receiver is bit-exact to batch at any
+        // chunk size, so this also exercises lock held across block boundaries.
+        const size_t CHUNK_SAMPLES = 4096;
+        std::vector<sample_t> chunk_buf;
+        chunk_buf.reserve(CHUNK_SAMPLES);
+
+        IQSample iq;
+        while (std::cin.read(reinterpret_cast<char*>(&iq), sizeof(iq))) {
+            chunk_buf.push_back(sample_t(iq.I, iq.Q));
+            if (chunk_buf.size() >= CHUNK_SAMPLES) {
+                total_samples += chunk_buf.size();
+                rx.process(chunk_buf.data(), chunk_buf.size(), emit);
+                chunk_buf.clear();
+            }
+        }
+        if (!chunk_buf.empty()) {
+            total_samples += chunk_buf.size();
+            rx.process(chunk_buf.data(), chunk_buf.size(), emit);
+        }
+
+        if (!quiet) {
+            fprintf(stderr, "\n════════════════════════════════════════════════════════════════════\n");
+            fprintf(stderr, "Summary (coherent): %d frames (%d perfect, %d errors)\n",
+                    decoded, perfect, decoded - perfect);
+            fprintf(stderr, "Total: %zu symbols, locked hypothesis: %d\n",
+                    rx.total_symbols(), rx.locked_hyp());
+            fprintf(stderr, "Final state: %s\n", state_name(rx.sync_state()));
+            fprintf(stderr, "════════════════════════════════════════════════════════════════════\n");
+        }
+        return decoded > 0 ? 0 : 1;
+    }
+
     if (streaming) {
         if (!quiet)
             fprintf(stderr, "Streaming mode: processing data as it arrives...\n\n");

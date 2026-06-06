@@ -590,8 +590,13 @@ public:
         const double inc2 = TWO_PI * (+FREQ_DEV + freq_offset_) / Fs;
         const int    M    = std::max(MF_M, (int)std::lround(sps_nom_)); // >=1 sub-sample/sample
         const double step = sps_nom_ / (double)M;
-        std::complex<double> lo1(std::cos(inc1*base), std::sin(inc1*base));
-        std::complex<double> lo2(std::cos(inc2*base), std::sin(inc2*base));
+        // LO phase is referenced to the ABSOLUTE sample position (base + the
+        // cumulative streaming offset), not the buffer-local position. This keeps
+        // the tone reference phase-continuous across streaming chunk boundaries;
+        // strm_abs_base_ is 0 for the batch/one-shot path, so they are unaffected.
+        const double ph   = base + strm_abs_base_;
+        std::complex<double> lo1(std::cos(inc1*ph), std::sin(inc1*ph));
+        std::complex<double> lo2(std::cos(inc2*ph), std::sin(inc2*ph));
         const std::complex<double> w1(std::cos(inc1*step), std::sin(inc1*step));
         const std::complex<double> w2(std::cos(inc2*step), std::sin(inc2*step));
         std::complex<double> a1(0,0), a2(0,0);
@@ -677,6 +682,90 @@ public:
         }
     }
 
+    // Streaming front-end: stateful across chunks. Carries the timing loop, the
+    // Costas phase, and the 2T/differential boundary state so the symbol stream
+    // is CONTINUOUS across block boundaries (a dropped symbol would flip parity).
+    // Emits both parity streams (dec0,dec1) for the symbols completed in this
+    // block, and reports how many input samples were consumed; the caller keeps
+    // the unconsumed tail and prepends it to the next block.
+    void demodulate_stream(const sample_t* s, size_t n,
+                           std::vector<double>& dec0, std::vector<double>& dec1,
+                           size_t& consumed,
+                           std::vector<std::complex<double>>* Y1dbg = nullptr,
+                           std::vector<std::complex<double>>* Y2dbg = nullptr) {
+        if (!strm_init_) { strm_pos_ = el_offset_ + 1.0; strm_init_ = true; }
+        const double EL = el_offset_;
+        auto boxplus = [](double a, double b) {
+            double sg = ((a < 0) != (b < 0)) ? -1.0 : 1.0;
+            return sg * std::min(std::fabs(a), std::fabs(b));
+        };
+        double pos = strm_pos_;
+        // Forward margin must cover the LATE gate's matched-filter footprint
+        // (base=pos+EL, M sub-samples spanning ~sps_nom_) plus the cubic interp
+        // margin, with slack -- otherwise interp_lin clamps the tail samples and
+        // corrupts X[last] (which also poisons the prior symbol's 2T pairing).
+        // Any symbol short of this is deferred; the leftover tail carries it to
+        // the next block where the prepended samples give it clean context.
+        const double fwd_margin = sps_nom_ + EL + 4.0;
+        while (pos + fwd_margin < (double)n && pos - EL - 1.0 >= 0.0) {
+            std::complex<double> Y1, Y2, Y1e, Y2e, Y1l, Y2l;
+            corr_at(s, n, pos,      Y1,  Y2);
+            corr_at(s, n, pos - EL, Y1e, Y2e);
+            corr_at(s, n, pos + EL, Y1l, Y2l);
+            if (Y1dbg) Y1dbg->push_back(Y1);
+            if (Y2dbg) Y2dbg->push_back(Y2);
+
+            // timing TED (normalized ML-gradient on the dominant tone)
+            bool t1 = std::norm(Y1) > std::norm(Y2);
+            std::complex<double> ya = t1 ? Y1 : Y2;
+            std::complex<double> dy = t1 ? (Y1l - Y1e) : (Y2l - Y2e);
+            double terr = (ya.real()*dy.real() + ya.imag()*dy.imag()) / (std::norm(ya) + 1e-9);
+            strm_tfreq_ += beta_t_ * terr;
+            strm_tfreq_  = std::clamp(strm_tfreq_, -0.05, 0.05);
+            double adj = std::clamp(alpha_t_ * terr + strm_tfreq_, -2.0, 2.0);
+
+            // decision-switched Costas (streaming) -> de-rotated arms
+            std::complex<double> rot(std::cos(cb_theta_), -std::sin(cb_theta_));
+            std::complex<double> y1 = Y1*rot, y2 = Y2*rot;
+            double Xk = y1.imag(), Yvk = y2.imag();
+            const std::complex<double>& act = (std::norm(y2) > std::norm(y1)) ? y2 : y1;
+            double m = std::abs(act) + 1e-9;
+            double cerr = -(act.real() * ((act.imag() < 0) ? -1.0 : 1.0)) / m;
+            cb_cfreq_ += 2e-4 * cerr;
+            cb_theta_ += 0.01 * cerr + cb_cfreq_;
+
+            // 2T combine + soft-differential, one-symbol delayed (needs X[k+1]).
+            if (cb_have_) {
+                double A = cb_Xp_ + Xk, B = cb_Yvp_ + Yvk;
+                for (int parity = 0; parity < 2; ++parity) {
+                    double sgn = (((cb_idx_ + parity) & 1) == 0) ? 1.0 : -1.0;
+                    double enc = A - sgn * B;
+                    double encprev = (parity == 0) ? cb_e0p_ : cb_e1p_;
+                    double decv = cb_have2_ ? boxplus(enc, encprev) : 0.0;
+                    if (parity == 0) { dec0.push_back(decv); cb_e0p_ = enc; }
+                    else             { dec1.push_back(decv); cb_e1p_ = enc; }
+                }
+                cb_have2_ = true;
+                cb_idx_++;
+            }
+            cb_Xp_ = Xk; cb_Yvp_ = Yvk; cb_have_ = true;
+            pos += sps_nom_ + adj;
+        }
+        double keep_from = pos - EL - 1.0;
+        if (keep_from < 0.0) keep_from = 0.0;
+        if (keep_from > (double)n) keep_from = (double)n;
+        consumed = (size_t)keep_from;
+        strm_pos_ = pos - (double)consumed;
+        strm_abs_base_ += (double)consumed;   // keep tone LO phase continuous across chunks
+    }
+
+    void reset_stream() {
+        strm_init_ = false; strm_tfreq_ = 0.0; strm_abs_base_ = 0.0;
+        cb_theta_ = 0.0; cb_cfreq_ = 0.0;
+        cb_have_ = false; cb_have2_ = false; cb_idx_ = 0;
+        cb_Xp_ = cb_Yvp_ = cb_e0p_ = cb_e1p_ = 0.0;
+    }
+
     static sample_t interp_lin(const sample_t* s, double idx, size_t len) {
         // Cubic (Catmull-Rom) interpolation; the coherent 2T detector is more
         // timing-sensitive than the non-coherent path, and cubic measurably
@@ -713,6 +802,21 @@ private:
     double ted_slope_ = 0.018;             // measured normalized TED gain (err / sample)
     double alpha_t_   = 0.06;              // PI proportional gain (model-validated)
     double beta_t_    = 0.0025;            // PI integral gain
+
+    // Streaming (demodulate_stream) state, carried across chunk boundaries.
+    bool   strm_init_  = false;            // lazy init of strm_pos_ to EL+1
+    double strm_abs_base_ = 0.0;           // cumulative consumed samples (absolute LO phase ref)
+    double strm_pos_   = 0.0;              // fractional timing position within the block
+    double strm_tfreq_ = 0.0;              // timing-loop integral (NCO frequency)
+    double cb_theta_   = 0.0;              // Costas phase accumulator
+    double cb_cfreq_   = 0.0;              // Costas frequency integral
+    bool   cb_have_    = false;            // a prior symbol's X/Yv is held (for 2T pairing)
+    bool   cb_have2_   = false;            // a prior enc is held (for soft-differential)
+    long   cb_idx_     = 0;                // global symbol index, for (-1)^i parity continuity
+    double cb_Xp_      = 0.0;              // held X[k-1]  (Im of de-rotated tone-1 corr)
+    double cb_Yvp_     = 0.0;              // held Yv[k-1] (Im of de-rotated tone-2 corr)
+    double cb_e0p_     = 0.0;              // held enc[k-1] for parity 0
+    double cb_e1p_     = 0.0;              // held enc[k-1] for parity 1
 };
 
 //------------------------------------------------------------------------------
@@ -1220,4 +1324,135 @@ private:
     FrameDecoder       fdec_;
     SymbolLockDetector sym_lock_;
     size_t             total_symbols_ = 0;
+};
+
+//------------------------------------------------------------------------------
+// CoherentChannelReceiver  --  live (streaming) coherent sibling of
+// ChannelReceiver. The proven non-coherent ChannelReceiver above is UNTOUCHED;
+// coherent does not become the default until it is proven over the air.
+//
+// Three layers, mirroring the HDL's modular split:
+//   (1) waveform  : CoherentMSKDemodulator streaming front-end (fractional
+//                   timing + Costas + 2T/differential), carried statefully
+//                   across chunks. Emits BOTH parity interpretations (dec0,dec1)
+//                   with no sync-word or polarity decision -- protocol-agnostic.
+//   (2) framing   : FOUR unmodified SyncTrackers fed dec0, -dec0, dec1, -dec1.
+//                   Only the correct parity+polarity hypothesis correlates the
+//                   sync word and locks; the scrambled-parity and inverted-
+//                   polarity streams stay HUNTING on noise. Per-ACQUISITION
+//                   4-fold resolution falls out for free: every burst, the
+//                   matching tracker locks; on silence all drop to HUNTING and
+//                   the next burst re-resolves (just as the radio did via sync).
+//   (3) fec       : FrameDecoder on whichever hypothesis produced a frame.
+//
+// Symbol continuity across chunk boundaries is mandatory for coherent (a dropped
+// symbol flips the (-1)^n parity), so this receiver buffers the leftover sample
+// tail and prepends it to the next block -- unlike the AFC path which tolerates
+// boundary slips.
+//------------------------------------------------------------------------------
+class CoherentChannelReceiver {
+public:
+    struct Frame {
+        std::array<uint8_t, FRAME_BYTES> bytes;
+        int    metric       = -1;
+        double sync_quality = 0.0;
+        int    hypothesis   = -1;   // 0..3 = {dec0+, dec0-, dec1+, dec1-}
+    };
+
+    CoherentChannelReceiver() {
+        demod_.reset_stream();
+        // First cut: let all four hypotheses search. The sync-word threshold
+        // (8:1 PSLR pattern) guards against false locks on noise; SymbolLock
+        // gating is a later refinement.
+        for (auto& t : trk_) t.set_symbol_lock(true);
+    }
+
+    // --- configuration passthrough ---
+    void   set_nominal_sps(double sps)      { demod_.set_nominal_sps(sps); }
+    double get_nominal_sps() const          { return demod_.get_nominal_sps(); }
+    void   set_freq_offset(double hz)       { demod_.set_freq_offset(hz); }
+    double get_freq_offset() const          { return demod_.get_freq_offset(); }
+    void   set_timing_bandwidth(double BnT, double zeta = 0.707) { demod_.set_timing_bandwidth(BnT, zeta); }
+    void   set_timing_gains(double a, double b) { demod_.set_timing_gains(a, b); }
+
+    // --- status accessors ---
+    SyncState sync_state()    const { return trk_[committed_ >= 0 ? committed_ : 0].get_state(); }
+    int       locked_hyp()    const { return committed_; }
+    size_t    total_symbols() const { return total_symbols_; }
+
+    // Streaming entry point. Buffers the leftover sample tail internally so the
+    // symbol stream is continuous across calls; emits each frame the instant it
+    // completes. gate is accepted for interface symmetry with ChannelReceiver
+    // (unused in this first cut -- all hypotheses search unconditionally).
+    template <class OnFrame>
+    void process(const sample_t* samples, size_t n, OnFrame&& on_frame, bool /*gate*/ = true) {
+        // buf = leftover tail ++ new samples
+        std::vector<sample_t> buf;
+        buf.reserve(leftover_.size() + n);
+        buf.insert(buf.end(), leftover_.begin(), leftover_.end());
+        buf.insert(buf.end(), samples, samples + n);
+
+        std::vector<double> dec0, dec1;
+        size_t consumed = 0;
+        demod_.demodulate_stream(buf.data(), buf.size(), dec0, dec1, consumed);
+        if (consumed > buf.size()) consumed = buf.size();
+        leftover_.assign(buf.begin() + consumed, buf.end());
+
+        const size_t nsym = std::min(dec0.size(), dec1.size());
+        for (size_t i = 0; i < nsym; ++i) {
+            const double soft[4] = { dec0[i], -dec0[i], dec1[i], -dec1[i] };
+            for (int h = 0; h < 4; ++h) {
+                auto res = trk_[h].process(soft[h], total_symbols_ + i);
+                if (!res.frame_ready || res.payload.empty()) continue;
+                Frame f;
+                int metric = fdec_.decode(res.payload.data(), f.bytes);
+                if (metric < 0) continue;
+                f.metric       = metric;
+                f.sync_quality = res.sync_quality;
+                f.hypothesis   = h;
+
+                if (committed_ < 0) {
+                    // Resolve this acquisition. The sync word alone cannot separate
+                    // the parities (when the orthogonal arm B~=0, dec0~=dec1 at sync,
+                    // so multiple trackers correlate 1.0). FEC is the true arbiter:
+                    // the correct parity/polarity decodes to valid codewords (low
+                    // metric); the others are forced garbage (metric ~ ENCODED_BITS).
+                    // Commit to the first hypothesis that clears the threshold.
+                    if (metric <= COMMIT_METRIC_MAX) {
+                        committed_ = h;
+                        on_frame(static_cast<const Frame&>(f));
+                    }
+                    // else: wrong hypothesis -- suppress.
+                } else if (h == committed_) {
+                    // Committed: emit this hypothesis' frames (any metric -- real
+                    // channel errors are valid corrected data); suppress the rest.
+                    on_frame(static_cast<const Frame&>(f));
+                }
+            }
+            // Release the commitment when the committed hypothesis loses lock
+            // (silence / end of burst). The next burst re-resolves from scratch --
+            // per-ACQUISITION resolution, exactly as the radio did via sync.
+            if (committed_ >= 0 && trk_[committed_].get_state() == SyncState::HUNTING)
+                committed_ = -1;
+        }
+        total_symbols_ += nsym;
+    }
+
+    std::vector<Frame> process(const sample_t* samples, size_t n, bool gate = true) {
+        std::vector<Frame> frames;
+        process(samples, n, [&frames](const Frame& f){ frames.push_back(f); }, gate);
+        return frames;
+    }
+
+private:
+    // FEC-metric ceiling for committing to a hypothesis. Far above a valid decode
+    // (0..few) and far below forced garbage (~ENCODED_BITS); scales with frame size.
+    static constexpr int COMMIT_METRIC_MAX = (int)(ENCODED_BITS / 2);
+
+    CoherentMSKDemodulator demod_;
+    SyncTracker            trk_[4];          // dec0+, dec0-, dec1+, dec1-
+    FrameDecoder           fdec_;
+    std::vector<sample_t>  leftover_;        // un-consumed sample tail (symbol continuity)
+    size_t                 total_symbols_ = 0;
+    int                    committed_     = -1;   // resolved hypothesis (-1 = re-resolving)
 };
