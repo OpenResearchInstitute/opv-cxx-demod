@@ -402,3 +402,45 @@ for e in [4,6,8,10]:
     print(f" {e:4d}    {ber:.3e}        {Q(np.sqrt(2*10**(e/10))):.3e}")
 print(" -> full coherent gain confirmed on the real modulation; ~3000x better than")
 print("    non-coherent |Y| at 10 dB. (Perfect carrier/timing; recovery adds on top.)")
+
+print()
+print("==== Carrier recovery (validated): Massey detector + de Buda seed + decision-switched Costas ====")
+# Parallel-tone Massey detector (the VHDL/port form): X=Im(Y1), Y=Im(Y2),
+#   A(i)=X(i)+X(i+1), B(i)=(-1)^i[Y(i)+Y(i+1)], soft=A-B, sign, differential decode.
+def massey_decode(Y1,Y2):
+    X=Y1.imag; Yv=Y2.imag; N=len(X)
+    As=X+np.r_[X[1:],0]; Bs=Yv+np.r_[Yv[1:],0]
+    soft=As-((-1)**np.arange(N))*Bs; enc=(soft<0).astype(int)
+    return np.bitwise_xor(enc, np.r_[0,enc[:-1]])
+# de Buda coarse frequency estimate: square (removes data) -> lines at 2*foff +/- 2*dev.
+def debuda_estimate(s_off, nsym=1500):
+    sq=(s_off[:nsym*SPS])**2; n=len(sq)
+    P=np.abs(np.fft.fftshift(np.fft.fft(sq)))**2; f=np.fft.fftshift(np.fft.fftfreq(n,1/Fs))
+    def pk(lo,hi):
+        idx=np.where((f>=lo)&(f<=hi))[0]; k=idx[np.argmax(P[idx])]
+        a,b,c=P[k-1],P[k],P[k+1]; d=0.5*(a-c)/(a-2*b+c+1e-30); return f[k]+d*(f[1]-f[0])
+    return (pk(-2*DEV-6000,-2*DEV+6000)+pk(2*DEV-6000,2*DEV+6000))/4.0
+# Two decision-switched Costas loops, seeded by the estimate (loop cancels offset -> seed -DEV sign).
+_nw1=2*np.pi*(-DEV)/Fs; _nw2=2*np.pi*(+DEV)/Fs
+def carrier_recover(s_off, Kp=0.006, Ki=1.2e-5):
+    N=len(s_off)//SPS; w=-2*np.pi*debuda_estimate(s_off)/Fs
+    th1=0.0;f1=w; th2=0.0;f2=w; Y1=np.zeros(N,complex); Y2=np.zeros(N,complex); il=np.arange(SPS)
+    for n in range(N):
+        g0=n*SPS
+        r1=np.exp(1j*(_nw1*(g0+il)+th1+f1*il)); r2=np.exp(1j*(_nw2*(g0+il)+th2+f2*il))
+        seg=s_off[g0:g0+SPS]; y1=np.sum(seg*r1); y2=np.sum(seg*r2); Y1[n]=y1; Y2[n]=y2
+        if abs(y1.imag)>abs(y2.imag):                       # decision-directed gating
+            ds=np.sign(y1.imag); e=ds*y1.real/(abs(y1)+1e-9); f1+=Ki*e; th1+=f1*SPS+Kp*e; th2+=f2*SPS
+        else:
+            ds=np.sign(y2.imag); e=ds*y2.real/(abs(y2)+1e-9); f2+=Ki*e; th2+=f2*SPS+Kp*e; th1+=f1*SPS
+    return Y1,Y2
+def _awgn(s,e):
+    var=SPS/(10**(e/10)); return s+(np.random.randn(len(s))+1j*np.random.randn(len(s)))*np.sqrt(var/2)
+np.random.seed(11); src=np.random.randint(0,2,40000); s=HDLMod().modulate(src)
+print(" cold start: de Buda estimate -> seeded decision-switched Costas -> Massey detector")
+print(" EbN0  offset   f_est     cold-BER    theory   (perfect timing; beat-timing is the last step)")
+for e,foff in [(6,-800.0),(8,1700.0),(10,-2000.0)]:
+    so=_awgn(s,e)*np.exp(1j*2*np.pi*foff*np.arange(len(s))/Fs)
+    fe=debuda_estimate(so); Y1,Y2=carrier_recover(so); dec=massey_decode(Y1,Y2)
+    ber=np.mean(dec[2500:-3]!=src[2500:-3])
+    print(f" {e:4d}  {foff:+6.0f}  {fe:+7.1f}   {ber:.3e}   {Q(np.sqrt(2*10**(e/10))):.3e}")
