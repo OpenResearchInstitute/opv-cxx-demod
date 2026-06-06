@@ -160,3 +160,50 @@ print("\nApprox Eb/N0 to reach BER=1e-2:")
 print("  coherent  ~4.3 dB  (= BPSK, Q(sqrt(2Eb/N0)))")
 print("  energy    ~12 dB   -> realizable modem gain ~7-8 dB PRE-FEC")
 print("  (rate-1/2 K=7 FEC compresses the post-FEC system gain; bench is authority)")
+
+print()
+print("==== Drop-in coherent soft (OPV-compatible): carrier lock + Re()^2 difference ====")
+# Same per-symbol, same e2-e1 sign convention as the current C++ demod, but:
+#  (1) Q*sign(I) Costas removes the carrier, (2) decision uses Re()^2 not |.|^2,
+#      which rejects the imaginary-axis wrong-tone crosstalk -> coherent gain.
+def demod_coherent_dropin(rx, pll_a=0.02, pll_b=0.001):
+    n=len(rx)//SPS; t=np.arange(SPS)/Fs
+    lo1=np.exp(-1j*2*np.pi*(-DEV)*t); lo2=np.exp(-1j*2*np.pi*(+DEV)*t)
+    seg=rx[:n*SPS].reshape(n,SPS); Y1=seg@lo1; Y2=seg@lo2
+    theta=0.0; freq=0.0; soft=np.zeros(n)
+    for k in range(n):
+        rot=np.exp(-1j*theta); y1=Y1[k]*rot; y2=Y2[k]*rot
+        dom = y1 if abs(y1)>abs(y2) else y2
+        I,Qd=dom.real,dom.imag
+        err=(Qd*np.sign(I))/(abs(dom)+1e-9)
+        freq+=pll_b*err; theta+=pll_a*err+freq
+        soft[k]=y2.real**2 - y1.real**2          # coherent, OPV e2-e1 convention
+    return np.where(soft>0,1,-1)
+
+np.random.seed(11)
+print(" EbN0   coherent_dropin   non-coherent   (with 400 Hz offset present)")
+for e in [4,6,8,10,12]:
+    N=300000; d=np.random.randint(0,2,N)*2-1
+    s=mod_msk(d); s=s*np.exp(1j*2*np.pi*400*np.arange(len(s))/Fs)  # carrier offset
+    rx=add_awgn(s,e)
+    bc=np.mean(demod_coherent_dropin(rx)[300:]!=d[300:]) ; bn=np.mean(demod_noncoherent(rx)!=d)
+    print(f" {e:4d}   {bc:.3e}        {bn:.3e}")
+
+print()
+print("==== WHY the drop-in fails: the MSK phase rotates pi/2 per symbol ====")
+np.random.seed(5)
+N=20; d=np.random.randint(0,2,N)*2-1
+s=mod_msk(d)                                   # no noise, no offset (ideal)
+t=np.arange(SPS)/Fs
+lo1=np.exp(-1j*2*np.pi*(-DEV)*t); lo2=np.exp(-1j*2*np.pi*(+DEV)*t)
+seg=s[:N*SPS].reshape(N,SPS)
+Y1=seg@lo1; Y2=seg@lo2
+print(" sym  d   |Y_active|   Re(Y_active)   phase(Y_active)/(pi/2)")
+for k in range(8):
+    Ya = Y2[k] if d[k]>0 else Y1[k]
+    print(f" {k:3d} {d[k]:+d}   {abs(Ya):8.1f}    {Ya.real:+9.1f}     {np.angle(Ya)/(np.pi/2):+.2f}")
+print("Note: |Y_active| is always large (tone is right), but Re(Y_active) swings")
+print("through ~0 because the symbol-start phase steps by pi/2 each symbol.")
+print("=> a per-symbol real-part decision cannot work; coherent MSK needs the")
+print("   2T (OQPSK) matched filter that follows the phase trellis (what the")
+print("   VHDL does via its 2-symbol sum + cclk arm-select + differential decode).")
