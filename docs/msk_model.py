@@ -207,3 +207,87 @@ print("through ~0 because the symbol-start phase steps by pi/2 each symbol.")
 print("=> a per-symbol real-part decision cannot work; coherent MSK needs the")
 print("   2T (OQPSK) matched filter that follows the phase trellis (what the")
 print("   VHDL does via its 2-symbol sum + cclk arm-select + differential decode).")
+
+print()
+print("==== INTEGRATED coherent MSK: 2T matched filter + decision-directed carrier recovery ====")
+# OQPSK/2T view. Half-sine pulse over 2T. I-rail decisions every 2T at t=2kT,
+# Q-rail every 2T at t=2kT+T (staggered). A staggered decision-directed Costas
+# recovers the carrier; each rail's 2T matched-filter output makes the decision.
+def integrated_coherent(rx, recover=True, pll_a=0.01, pll_b=2e-4):
+    L = 2*SPS
+    g = np.sin(np.pi*np.arange(L)/L); g = g/np.sqrt(np.dot(g,g))   # unit-energy MF
+    theta = 0.0; freq = 0.0
+    M = (len(rx)-L)//SPS                       # number of T-spaced decision instants
+    rail = np.zeros(M)                          # soft rail values, alternating I,Q
+    for m in range(M):
+        n = m*SPS
+        idx = np.arange(L)
+        derot = rx[n:n+L]*np.exp(-1j*(theta + freq*idx))   # apply carrier estimate over window
+        z = np.dot(derot, g)                    # 2T matched filter output (complex)
+        if m % 2 == 0:                          # I rail: signal on real axis
+            a_hat = np.sign(z.real); err = (np.sign(z.real)*z.imag)
+            rail[m] = z.real
+        else:                                   # Q rail: signal on imaginary axis
+            a_hat = np.sign(z.imag); err = (-np.sign(z.imag)*z.real)
+            rail[m] = z.imag
+        if recover:
+            err /= (abs(z)+1e-9)
+            freq += pll_b*err
+            theta += pll_a*err + freq*SPS       # advance carrier phase one symbol (T)
+    return rail   # rail[0,2,4..]=I decisions, rail[1,3,5..]=Q decisions
+
+def rails_to_ber(rail, aI, aQ):
+    aIh = np.sign(rail[0::2]); aQh = np.sign(rail[1::2])
+    # resolve the 4-fold phase ambiguity the way the sync word would (pick best)
+    best = 1.0
+    for sI in (1,-1):
+        for sQ in (1,-1):
+            m=min(len(aIh),len(aI)); mq=min(len(aQh),len(aQ))
+            e=(np.sum(sI*aIh[:m]!=aI[:m])+np.sum(sQ*aQh[:mq]!=aQ[:mq]))/(m+mq)
+            best=min(best,e)
+    return best
+
+np.random.seed(21)
+print(" EbN0   perfect-carrier   with 500Hz offset+recovery   theory Q(sqrt(2Eb/N0))")
+for e in [4,6,8,10]:
+    NB=200000
+    s,aI,aQ = gen_oqpsk_msk(NB, seed=e+30)
+    rx0 = add_awgn_emp(s, e, NB)
+    b0 = rails_to_ber(integrated_coherent(rx0, recover=False), aI, aQ)
+    s_off = s*np.exp(1j*2*np.pi*500*np.arange(len(s))/Fs)
+    rxo = add_awgn_emp(s_off, e, NB)
+    bo = rails_to_ber(integrated_coherent(rxo, recover=True), aI, aQ)
+    print(f" {e:4d}   {b0:.3e}        {bo:.3e}              {Q(np.sqrt(2*10**(e/10))):.3e}")
+
+print()
+print("==== Acquisition: BER vs residual offset (after coarse estimate) at low SNR ====")
+print("(real system: coarse freq estimate + 24-bit sync word shrink the residual the loop must pull in)")
+np.random.seed(31)
+for e in [5,6]:
+    print(f" EbN0={e} dB:   residual_offset -> BER")
+    NB=200000
+    s,aI,aQ = gen_oqpsk_msk(NB, seed=e+50)
+    row=[]
+    for foff in [0,10,25,50,100,200,500]:
+        so = s*np.exp(1j*2*np.pi*foff*np.arange(len(s))/Fs)
+        rx = add_awgn_emp(so, e, NB)
+        b = rails_to_ber(integrated_coherent(rx, recover=True), aI, aQ)
+        row.append(f"{foff:>4d}Hz:{b:.2e}")
+    print("   "+"  ".join(row))
+print()
+print("==== Two-stage loop (wide acquire -> narrow track) for cold 500 Hz at low SNR ====")
+def integrated_2stage(rx, aI, aQ):
+    # wide bandwidth first 1500 symbols to acquire, then narrow to track
+    L=2*SPS; g=np.sin(np.pi*np.arange(L)/L); g/=np.sqrt(np.dot(g,g))
+    theta=0.0; freq=0.0; M=(len(rx)-L)//SPS; rail=np.zeros(M); idx=np.arange(L)
+    for m in range(M):
+        a_w,b_w = (0.05,2e-3) if m<2000 else (0.008,1.5e-4)   # acquire then track
+        n=m*SPS; z=np.dot(rx[n:n+L]*np.exp(-1j*(theta+freq*idx)), g)
+        if m%2==0: err=np.sign(z.real)*z.imag; rail[m]=z.real
+        else:      err=-np.sign(z.imag)*z.real; rail[m]=z.imag
+        err/=(abs(z)+1e-9); freq+=b_w*err; theta+=a_w*err+freq*SPS
+    return rails_to_ber(rail, aI, aQ)
+for e in [5,6,8]:
+    NB=200000; s,aI,aQ=gen_oqpsk_msk(NB,seed=e+70)
+    so=s*np.exp(1j*2*np.pi*500*np.arange(len(s))/Fs); rx=add_awgn_emp(so,e,NB)
+    print(f" EbN0={e} dB, cold 500Hz, two-stage: BER={integrated_2stage(rx,aI,aQ):.2e}  (theory {Q(np.sqrt(2*10**(e/10))):.2e})")
