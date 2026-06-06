@@ -439,17 +439,16 @@ private:
 class CoherentMSKDemodulator {
 public:
     CoherentMSKDemodulator() 
-        : freq_offset_(0), carrier_phase_(0),
-          phase_f1_(0), phase_f2_(0),
-          loop_freq_(0),
-          // Costas loop gains (2nd order loop)
-          // BW ~= 0.01 * symbol_rate for acquisition, narrower for tracking
-          pll_alpha_(0.01),    // Phase gain (proportional)
-          pll_beta_(0.001)     // Frequency gain (integral)
+        : freq_offset_(0),
+          // pll_alpha_/pll_beta_ are vestigial now: demodulate() uses fixed Costas
+          // gains; set_pll_bandwidth() (called from the driver) still writes them.
+          pll_alpha_(0.01),
+          pll_beta_(0.001)
     {}
     
     // Estimate carrier offset from spectrum (coarse AFC) - same as non-coherent
     double estimate_offset(const sample_t* samples, size_t num_samples) {
+        (void)samples; (void)num_samples; return 0.0;  // Milestone 1: perfect-carrier (OFFSET=0); de Buda replaces this
         double best_offset = 0;
         double best_energy = 0;
         
@@ -527,92 +526,110 @@ public:
     void demodulate(const sample_t* samples, size_t num_samples,
                     std::vector<double>& soft_out) {
         soft_out.clear();
-        
-        double phase_inc_f1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
-        double phase_inc_f2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
-        
-        for (size_t sym = 0; sym < num_samples / SAMPLES_PER_SYMBOL; ++sym) {
-            std::complex<double> corr_f1(0, 0), corr_f2(0, 0);
-            
-            // Integrate over symbol with carrier phase correction
+        size_t nsym = num_samples / SAMPLES_PER_SYMBOL;
+        if (nsym < 3) return;
+
+        // --- Per-symbol tone correlations, continuous-phase reference ---
+        // Y_k = sum_n s[n] * conj(e^{-j 2pi f n / Fs}). The active tone lands its
+        // energy on the imaginary axis (sign = differential precoding); the
+        // wrong-tone crosstalk lands on the real axis. Keeping only Im() rejects
+        // that crosstalk -- the basis of the coherent advantage.
+        const double inc1 = TWO_PI * (-FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+        const double inc2 = TWO_PI * (+FREQ_DEV + freq_offset_) / SAMPLE_RATE;
+        const std::complex<double> w1(std::cos(inc1), std::sin(inc1));   // e^{+j inc}
+        const std::complex<double> w2(std::cos(inc2), std::sin(inc2));
+        std::vector<std::complex<double>> Y1(nsym), Y2(nsym);
+        for (size_t k = 0; k < nsym; ++k) {
+            double b1 = inc1 * (double)(k * SAMPLES_PER_SYMBOL);
+            double b2 = inc2 * (double)(k * SAMPLES_PER_SYMBOL);
+            std::complex<double> lo1(std::cos(b1), std::sin(b1));        // e^{+j inc * n}
+            std::complex<double> lo2(std::cos(b2), std::sin(b2));
+            std::complex<double> a1(0,0), a2(0,0);
             for (size_t i = 0; i < SAMPLES_PER_SYMBOL; ++i) {
-                size_t idx = sym * SAMPLES_PER_SYMBOL + i;
-                
-                // Apply carrier phase correction to the sample
-                std::complex<double> phase_rot(std::cos(carrier_phase_), -std::sin(carrier_phase_));
-                std::complex<double> corrected = samples[idx] * phase_rot;
-                
-                // Correlate with F1 and F2 tones
-                std::complex<double> lo_f1(std::cos(phase_f1_), std::sin(phase_f1_));
-                std::complex<double> lo_f2(std::cos(phase_f2_), std::sin(phase_f2_));
-                
-                corr_f1 += corrected * std::conj(lo_f1);
-                corr_f2 += corrected * std::conj(lo_f2);
-                
-                phase_f1_ += phase_inc_f1;
-                phase_f2_ += phase_inc_f2;
-                
-                // Advance carrier phase by loop frequency correction
-                carrier_phase_ += loop_freq_;
+                size_t n = k * SAMPLES_PER_SYMBOL + i;
+                a1 += samples[n] * lo1;  a2 += samples[n] * lo2;
+                lo1 *= w1;               lo2 *= w2;
             }
-            
-            // Wrap phases
-            while (phase_f1_ > PI) phase_f1_ -= TWO_PI;
-            while (phase_f1_ < -PI) phase_f1_ += TWO_PI;
-            while (phase_f2_ > PI) phase_f2_ -= TWO_PI;
-            while (phase_f2_ < -PI) phase_f2_ += TWO_PI;
-            while (carrier_phase_ > PI) carrier_phase_ -= TWO_PI;
-            while (carrier_phase_ < -PI) carrier_phase_ += TWO_PI;
-            
-            // Determine which tone is dominant (for phase error computation)
-            double f1_energy = std::norm(corr_f1);
-            double f2_energy = std::norm(corr_f2);
-            
-            // ===== COHERENT SOFT DECISION =====
-            // Use REAL parts (phase-sensitive), not magnitudes
-            // With proper phase tracking, the correlations should be mostly real
-            double soft_f1 = corr_f1.real();
-            double soft_f2 = corr_f2.real();
-            
-            // Soft decision: positive = F2 (bit 0), negative = F1 (bit 1)
-            // The sign now carries phase information!
-            soft_out.push_back(soft_f2 - soft_f1);
-            
-            // ===== COSTAS LOOP PHASE ERROR =====
-            // Decision-directed: use the dominant tone's phase to track carrier
-            // Phase error = Im(corr) / Re(corr) for small angles ≈ atan2(Im, Re)
-            std::complex<double> dominant = (f1_energy > f2_energy) ? corr_f1 : corr_f2;
-            
-            // Normalized phase error (avoid division by zero)
-            double mag = std::abs(dominant);
-            double phase_error = 0;
-            if (mag > 1e-10) {
-                // For decision-directed, we want the correlation to be real and positive
-                // But MSK alternates phase by ±90° per symbol, so we track that
-                // Simple approach: drive imaginary part to zero
-                phase_error = dominant.imag() / mag;  // sin(error) ≈ error for small angles
+            Y1[k] = a1;  Y2[k] = a2;
+        }
+
+        // --- Decision-switched Costas carrier recovery (Hodgart form) ---
+        // De-rotate each symbol's tone correlations by the tracked carrier phase,
+        // then take Im() for the Massey arms. The active tone is driven onto the
+        // imaginary axis (its energy axis), so Re(active) -> 0. Error sign (-1) and
+        // loop gains were validated against the offline model with offsets present.
+        std::vector<double> X(nsym, 0.0), Yv(nsym, 0.0);  // de-rotated Im(Y1), Im(Y2)
+        {
+            const double pll_a = 0.01, pll_b = 2e-4;
+            double theta = 0.0, freq = 0.0;
+            for (size_t k = 0; k < nsym; ++k) {
+                std::complex<double> rot(std::cos(theta), -std::sin(theta));
+                std::complex<double> y1 = Y1[k] * rot, y2 = Y2[k] * rot;
+                X[k]  = y1.imag();
+                Yv[k] = y2.imag();
+                const std::complex<double>& act = (std::norm(y2) > std::norm(y1)) ? y2 : y1;
+                double m = std::abs(act) + 1e-9;
+                double err = -(act.real() * ((act.imag() < 0) ? -1.0 : 1.0)) / m;  // esign = -1
+                freq  += pll_b * err;
+                theta += pll_a * err + freq;
             }
-            
-            // ===== LOOP FILTER (2nd order) =====
-            // Updates both phase and frequency estimates
-            loop_freq_ += pll_beta_ * phase_error;  // Integral path (frequency)
-            carrier_phase_ += pll_alpha_ * phase_error;  // Proportional path (phase)
-            
-            // Limit loop frequency to avoid runaway
-            loop_freq_ = std::clamp(loop_freq_, -0.1, 0.1);
-            
-            // NOTE: Coarse inter-symbol AFC is intentionally absent here.
-            // The 2nd-order Costas loop already provides frequency tracking
-            // via its integral path (loop_freq_). Running a separate AFC that
-            // also updates freq_offset_ and recomputes phase_inc_f1/f2 would
-            // create two coupled feedback paths chasing the same residual offset,
-            // which can cause oscillation and degrades the 3dB coherent gain.
-            // The initial estimate_offset() call gets close enough for PLL
-            // pull-in before demodulate() is invoked. The Costas loop owns it
-            // from there.
+        }
+
+        // --- Massey optimum 2T combine (parallel-tone / VHDL form) ---
+        //   A(i)=X(i)+X(i+1);  B(i)=Yv(i)+Yv(i+1)
+        //   enc_soft(i)=A(i) - (-1)^(i+parity) B(i)   (antipodal over 2T)
+        //   dec_soft(i)=boxplus(enc(i),enc(i-1))       (soft differential decode)
+        // (-1)^n parity phase and overall polarity form a 4-fold ambiguity the
+        // 24-bit sync word resolves (as the HDL does via cclk + sync). Try all
+        // four; keep the one the sync word correlates with most strongly.
+        auto boxplus = [](double a, double b) {
+            double s = ((a < 0) != (b < 0)) ? -1.0 : 1.0;
+            return s * std::min(std::fabs(a), std::fabs(b));
+        };
+        double pat[SYNC_BITS];                       // matches SyncTracker pattern
+        for (size_t i = 0; i < SYNC_BITS; ++i) {
+            int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
+            pat[i] = (bit == 1) ? -1.0 : 1.0;
+        }
+
+        int best_parity = 0; double best_pol = 1.0, best_peak = -2.0;
+        std::vector<double> dec(nsym, 0.0);
+        for (int parity = 0; parity < 2; ++parity) {
+            std::vector<double> enc(nsym, 0.0);
+            for (size_t i = 0; i + 1 < nsym; ++i) {
+                double A = X[i] + X[i+1], B = Yv[i] + Yv[i+1];
+                double sgn = (((i + parity) & 1) == 0) ? 1.0 : -1.0;
+                enc[i] = A - sgn * B;
+            }
+            dec[0] = 0.0;
+            for (size_t i = 1; i < nsym; ++i) dec[i] = boxplus(enc[i], enc[i-1]);
+            for (int pol = 0; pol < 2; ++pol) {
+                double s = pol ? -1.0 : 1.0, peak = -2.0;
+                for (size_t pos = 0; pos + SYNC_BITS <= nsym; ++pos) {
+                    double num = 0.0, den = 1e-9;
+                    for (size_t j = 0; j < SYNC_BITS; ++j) {
+                        double v = s * dec[pos + j];
+                        num += pat[j] * v;  den += std::fabs(v);
+                    }
+                    double c = num / den;
+                    if (c > peak) peak = c;
+                }
+                if (peak > best_peak) { best_peak = peak; best_parity = parity; best_pol = s; }
+            }
+        }
+
+        // rebuild the winning hypothesis and emit dec-domain soft (e2-e1 sign)
+        {
+            std::vector<double> enc(nsym, 0.0);
+            for (size_t i = 0; i + 1 < nsym; ++i) {
+                double A = X[i] + X[i+1], B = Yv[i] + Yv[i+1];
+                double sgn = (((i + best_parity) & 1) == 0) ? 1.0 : -1.0;
+                enc[i] = A - sgn * B;
+            }
+            soft_out.assign(nsym, 0.0);
+            for (size_t i = 1; i < nsym; ++i) soft_out[i] = best_pol * boxplus(enc[i], enc[i-1]);
         }
     }
-    
     double get_freq_offset() const { return freq_offset_; }
     
     // Set Costas loop bandwidth
@@ -629,11 +646,8 @@ public:
 
 private:
     double freq_offset_;
-    double carrier_phase_;      // Carrier phase estimate
-    double phase_f1_, phase_f2_;
-    double loop_freq_;          // Loop frequency correction (radians per sample)
-    double pll_alpha_;          // Phase error gain
-    double pll_beta_;           // Frequency error gain
+    double pll_alpha_;          // set by set_pll_bandwidth(); demodulate() uses fixed gains
+    double pll_beta_;
 };
 
 //------------------------------------------------------------------------------
@@ -654,10 +668,10 @@ public:
     static constexpr size_t CIRC_BUF_SIZE = FRAME_SYMBOLS * 3;  // 3 frames worth
     
     SyncTracker() : state_(SyncState::HUNTING),
+                    symbol_locked_(false),
+                    corr_buf_idx_(0), circ_write_idx_(0), total_symbols_(0),
                     symbols_since_sync_(0), consecutive_misses_(0),
-                    total_frames_(0), corr_buf_idx_(0),
-                    circ_write_idx_(0), total_symbols_(0),
-                    symbol_locked_(false) {
+                    total_frames_(0) {
         // Precompute sync word correlation pattern
         // For each bit: '1' expects negative soft (F1), '0' expects positive (F2)
         for (int i = 0; i < (int)SYNC_BITS; ++i) {
