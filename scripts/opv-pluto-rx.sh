@@ -282,8 +282,11 @@ fi
 
 IIO_CMD="$IIO_CMD $IIO_READ_OPTS cf-ad9361-lpc"
 
-# Build demodulator command with streaming flag
-DEMOD_CMD="$OPV_DEMOD -s"
+# Build demodulator command. Coherent (Costas-loop) streaming is the supported
+# receive path for OPV; it matches what opv-modem spawns. Native standalone
+# Pluto runs at 2.168 MSPS / 40 sps (integer timing), so no channel-rate (-R)
+# flag is used. (For a deliberate non-coherent A/B, run `opv-demod -s` by hand.)
+DEMOD_CMD="$OPV_DEMOD -s -c"
 if [[ $FREQ_OFFSET -ne 0 ]]; then
     DEMOD_CMD="$DEMOD_CMD -o $FREQ_OFFSET"
 fi
@@ -299,6 +302,7 @@ echo "==============================================" >&2
 echo "  Mode:       $MODE" >&2
 echo "  Frequency:  $(format_freq $RX_FREQ)" >&2
 echo "  Gain:       $RX_GAIN dB" >&2
+echo "  Demod mode: coherent (Costas loop)" >&2
 echo "  Demod:      $DEMOD_CMD" >&2
 if [[ -n "$IQ_FILE" ]]; then
     echo "  IQ Output:  $IQ_FILE" >&2

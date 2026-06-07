@@ -327,6 +327,9 @@ TX_PID=$!
 # =============================================================================
 
 # Start RX pipeline: iio_readdev | opv-modem -R
+# Coherent demod (Costas loop) is selected inside opv-modem, which spawns
+# `opv-demod -s -c -r`. Native standalone Pluto runs at 2.168 MSPS / 40 sps,
+# so no channel-rate (-R demod) flag is needed.
 MODEM_RX_OPTS="-R -r $RX_PORT -d $OPV_DEMOD"
 [[ $VERBOSE -eq 1 ]] && MODEM_RX_OPTS="$MODEM_RX_OPTS -v"
 

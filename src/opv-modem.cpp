@@ -580,8 +580,9 @@ public:
                 close(devnull);
             }
             
-            // Execute opv-demod with streaming and raw output
-            execlp(demod_path_.c_str(), demod_path_.c_str(), "-s", "-r", nullptr);
+            // Execute opv-demod with coherent (Costas) streaming and raw output.
+            // Coherent is the default receive path for OPV; add -c here.
+            execlp(demod_path_.c_str(), demod_path_.c_str(), "-s", "-c", "-r", nullptr);
             
             std::cerr << "Failed to exec " << demod_path_ << "\n";
             _exit(1);
@@ -937,7 +938,7 @@ int main(int argc, char* argv[]) {
             close(pipe_to_demod[0]);
             close(pipe_from_demod[1]);
             
-            execlp(demod_path.c_str(), demod_path.c_str(), "-s", "-r", nullptr);
+            execlp(demod_path.c_str(), demod_path.c_str(), "-s", "-c", "-r", nullptr);  // -c: coherent receive (default)
             std::cerr << "Error executing " << demod_path << "\n";
             _exit(1);
         }
