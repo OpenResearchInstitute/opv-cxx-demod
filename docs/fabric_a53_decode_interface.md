@@ -108,3 +108,56 @@ perfect; `DecodeBank -m 1` = 18/18.
    instantiated; refine the ~22 % headroom figure.
 5. **Multiplexed demod scheduling** — confirm the shared demod's per-channel
    cadence and tag format; finalize the `Rec` layout / DMA descriptor.
+
+---
+
+## CONCRETE SEAM (found in pluto_msk — seam B is mostly already built)
+
+pluto_msk `src/` already contains the full fabric decode chain, AXIS-connected:
+`frame_sync_detector_soft.vhd`, `ov_frame_decoder_soft.vhd`,
+`viterbi_decoder_k7_soft.vhd`, plus `axis_dma_adapter.vhd`. So seam B is a *tap*,
+not a new build.
+
+### The tap point: frame_sync_detector_soft.m_axis_soft_bit
+
+`frame_sync_detector_soft` takes the demod's `signed(15:0)` soft
+(`s_axis_soft_tdata` = rx_data_soft) and the hard bit, runs the sync-word
+correlator (`SYNC_WORD=x"02B8DB"`, HUNTING/LOCKED thresholds + flywheel +
+LOCK_FRAMES), quantizes to 3-bit, and emits:
+
+```
+m_axis_soft_bit_tdata  : std_logic_vector(2 DOWNTO 0)   -- SOFT_WIDTH=3, value 0..7
+m_axis_soft_bit_tvalid / tready / tlast                 -- TLAST = end of frame
+-- 2144 soft values per frame (PAYLOAD_BYTES=268 = 2144 bits)
+```
+
+That AXIS, routed through `axis_dma_adapter` → S2MM DMA, IS the seam-B interface:
+one TLAST burst = one frame = 2144 three-bit soft values, interleaved (on-air)
+order. For the multiplexed/shared demod, carry the channel on TID/TUSER (or one
+DMA channel per demod slot); A53 demuxes by tag.
+
+### Convention is already matched (no flip, no rescale)
+
+fabric `viterbi_decoder_k7_soft.vhd` branch metric (lines 90-91):
+`expected 0 -> metric = soft;  expected 1 -> metric = 7 - soft`.
+A53 `FrameDecoder` Viterbi: `bm = (e ? SOFT_MAX - sg : sg)`, SOFT_MAX=7. Identical
+(both NASA/CCSDS soft Viterbi). So the fabric's 3-bit bytes feed the A53 Viterbi
+directly.
+
+### A53 entry point: FrameDecoder::decode_soft3()
+
+`int decode_soft3(const uint8_t* sg /*2144 values 0..7, interleaved*/,
+                  std::array<uint8_t,FRAME_BYTES>& out);`
+Skips the double->quantize step (fabric already quantized); does deinterleave +
+Viterbi + derandomize. Validated bit-identical to decode() over 2000 frames.
+
+### What this collapses the A53 side to
+
+No SyncTracker, no demod, no streaming state: a pool of FrameDecoders, each fed a
+DMA'd 2144-byte frame buffer on the TLAST/interrupt, calling decode_soft3. Pure
+soft-real-time batch work (40 ms/frame slack), ~24 ch/core (decode_bench), 64 at
+~66% + DMA/control -- comfortable headroom, vs seam A's tight 78%.
+
+Open items 1 (sign/scale) and 2 (integration vector) are now mostly settled by
+reading the source; the integration vector test just confirms it on real silicon.
+Remaining: BER equivalence (link budget), DMA cost, multiplexed tag format.
