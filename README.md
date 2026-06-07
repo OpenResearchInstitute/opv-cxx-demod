@@ -27,7 +27,7 @@ the three layers you change — waveform, framing, FEC — and what you keep.
 ```bash
 make                                # build all binaries into bin/
 make test-coherent                  # coherent loopback self-test
-./opv-pluto.sh -f 435000000 -v      # full transceiver with Interlocutor (PlutoSDR)
+./scripts/opv-pluto.sh -f 435000000 -v      # full transceiver with Interlocutor (PlutoSDR)
 ```
 
 `make` now builds four programs: `opv-mod`, `opv-demod`, `opv-modem`, and
