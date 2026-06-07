@@ -26,7 +26,7 @@ the three layers you change — waveform, framing, FEC — and what you keep.
 
 ```bash
 make                                # build all binaries into bin/
-make test                           # loopback self-test
+make test-coherent                  # coherent loopback self-test
 ./opv-pluto.sh -f 435000000 -v      # full transceiver with Interlocutor (PlutoSDR)
 ```
 
