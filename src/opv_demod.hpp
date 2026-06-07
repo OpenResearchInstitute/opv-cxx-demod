@@ -65,12 +65,17 @@ struct IQSample { int16_t I, Q; };
 //------------------------------------------------------------------------------
 // Sync State Machine
 //------------------------------------------------------------------------------
-enum class SyncState { HUNTING, VERIFYING, LOCKED };
+// State machine mirrors frame_sync_detector_soft.vhd: HUNTING searches for the
+// sync peak and on a peak goes STRAIGHT to LOCKED (capturing P(0)); LOCKED
+// collects/emits the frame and performs the per-frame sync check + flywheel
+// (the VHDL's VERIFYING_SYNC post-frame check is folded into LOCKED here). There
+// is deliberately NO pre-frame "verify second sync" state -- the VHDL emits on
+// the first peak and must never drop the leading frame.
+enum class SyncState { HUNTING, LOCKED };
 
 inline const char* state_name(SyncState s) {
     switch (s) {
         case SyncState::HUNTING: return "HUNTING";
-        case SyncState::VERIFYING: return "VERIFYING";
         case SyncState::LOCKED: return "LOCKED";
     }
     return "?";
@@ -926,7 +931,6 @@ public:
         
         // Clear pending frame
         pending_frame_.reserve(ENCODED_BITS);
-        verified_frame_.reserve(ENCODED_BITS);
     }
     
     struct Result {
@@ -946,8 +950,9 @@ public:
                 fprintf(stderr, "[sync] Forcing HUNTING (symbol lock lost)\n");
                 state_ = SyncState::HUNTING;
                 collecting_payload_ = false;
-                verified_frame_.clear();
             }
+            prev_norm_corr_ = 0.0;   // clear peak history on lock loss
+            prev_raw_corr_  = 0.0;
         }
         symbol_locked_ = locked;
     }
@@ -984,71 +989,55 @@ public:
             
             double raw_corr;
             double norm_corr = soft_correlate(&raw_corr);
-            
-            if (raw_corr >= RAW_SYNC_HUNTING_THRESHOLD && norm_corr >= SOFT_SYNC_HUNTING_THRESHOLD) {
-                state_ = SyncState::VERIFYING;
-                sync_quality_ = norm_corr;
-                symbols_since_sync_ = 0;
-                
-                // Start collecting payload for this frame
+
+            // VHDL frame_sync_detector_soft HUNTING peak detection:
+            //   corr_prev >= HUNTING_THRESHOLD  AND  corr_v <= corr_prev
+            // i.e. the PREVIOUS symbol was an above-threshold correlation peak
+            // (sync word aligned there) and the correlation is now falling/flat.
+            //
+            // Level detection (corr_v >= threshold) is WRONG and diverges from
+            // the VHDL state machine: at the fractional channel rate (11.53 sps)
+            // the correlation skirt crosses threshold one or more symbols early,
+            // firing on the rising edge. That produces false locks (garbage
+            // leading frames) and a one-symbol P(0) misalignment. At the native
+            // integer rate the peak is so sharp that level==peak, which is why
+            // the bug was invisible there.
+            //
+            // On the falling edge the peak was the PREVIOUS symbol (= SYNC[23]
+            // alignment), so the CURRENT symbol is P(0). The VHDL captures P(0)
+            // on this transition clock (byte_v := "0000000" & rx_bit_r); we do
+            // the same and seed symbols_since_sync_ = 1 so the timed resync lands
+            // on SYNC[23] at count FRAME_SYMBOLS -- byte-for-byte identical
+            // framing to the steady-state LOCKED resync path.
+            bool prev_above = (prev_raw_corr_  >= RAW_SYNC_HUNTING_THRESHOLD &&
+                               prev_norm_corr_ >= SOFT_SYNC_HUNTING_THRESHOLD);
+            bool falling    = (raw_corr <= prev_raw_corr_);   // VHDL: corr_v <= corr_prev
+
+            if (prev_above && falling) {
+                state_ = SyncState::LOCKED;
+                sync_quality_ = prev_norm_corr_;   // quality of the PEAK (prev symbol)
+                consecutive_misses_ = 0;
+
+                // Capture P(0) now (current symbol), matching the VHDL which loads
+                // P(0) into byte_v on the HUNTING transition clock. NOTE the
+                // top-of-process() push did NOT run for this symbol (collecting
+                // was false while HUNTING), so we push P(0) explicitly here.
                 collecting_payload_ = true;
                 pending_frame_.clear();
-                
-                fprintf(stderr, "[%zu] HUNTING→VERIFYING (corr=%.3f, raw=%.0f)\n", 
-                        sym_idx, norm_corr, raw_corr);
+                pending_frame_.push_back(soft_val);
+                symbols_since_sync_ = 1;            // P(0) collected -> count = 1
+
+                if (kSyncTrace)
+                    fprintf(stderr, "[%zu] HUNTING->LOCKED peak (prev_corr=%.3f, prev_raw=%.0f)\n",
+                            sym_idx, prev_norm_corr_, prev_raw_corr_);
             }
+
+            // Track previous correlation for next-symbol peak detection.
+            prev_norm_corr_ = norm_corr;
+            prev_raw_corr_  = raw_corr;
             break;
         }
-        
-        case SyncState::VERIFYING: {
-            // ── Two-sync acquisition (matches HDL) ────────────────────
-            // Phase 1: collect payload after first sync hit
-            if (collecting_payload_ && pending_frame_.size() >= ENCODED_BITS) {
-                // Payload complete — stop collecting but stay in VERIFYING
-                collecting_payload_ = false;
-                verified_frame_ = std::move(pending_frame_);
-                verified_quality_ = sync_quality_;
-                pending_frame_.clear();
-                pending_frame_.reserve(ENCODED_BITS);
-            }
-            
-            // Phase 2: verify second sync at frame boundary
-            if (symbols_since_sync_ >= FRAME_SYMBOLS) {
-                double raw_corr;
-                double corr = soft_correlate(&raw_corr);
-                
-                if (corr >= SOFT_SYNC_LOCKED_THRESHOLD) {
-                    // ✓ Second sync confirmed — real signal
-                    state_ = SyncState::LOCKED;
-                    consecutive_misses_ = 0;
-                    total_frames_++;
-                    
-                    // Output the verified first frame
-                    res.frame_ready = true;
-                    res.sync_quality = verified_quality_;
-                    res.payload = std::move(verified_frame_);
-                    
-                    // Start collecting next frame's payload
-                    sync_quality_ = corr;
-                    collecting_payload_ = true;
-                    pending_frame_.clear();
-                    symbols_since_sync_ = 0;
-                    
-                    fprintf(stderr, "[%zu] VERIFYING→LOCKED (frame %d, verify corr=%.3f)\n", 
-                            sym_idx, total_frames_, corr);
-                } else {
-                    // ✗ Failed verification — false alarm, back to hunting
-                    state_ = SyncState::HUNTING;
-                    collecting_payload_ = false;
-                    verified_frame_.clear();
-                    
-                    fprintf(stderr, "[%zu] VERIFYING→HUNTING (verify FAILED, corr=%.3f)\n", 
-                            sym_idx, corr);
-                }
-            }
-            break;
-        }
-        
+
         case SyncState::LOCKED: {
             // Check for sync at expected position
             if (symbols_since_sync_ == FRAME_SYMBOLS) {
@@ -1062,17 +1051,22 @@ public:
                     collecting_payload_ = true;
                     pending_frame_.clear();
                     
-                    fprintf(stderr, "[%zu] LOCKED: sync OK (corr=%.3f)\n", sym_idx, corr);
+                    if (kSyncTrace)
+                        fprintf(stderr, "[%zu] LOCKED: sync OK (corr=%.3f)\n", sym_idx, corr);
                 } else {
                     // Missed sync
                     consecutive_misses_++;
-                    fprintf(stderr, "[%zu] LOCKED: sync MISS #%d (corr=%.3f)\n", 
-                            sym_idx, consecutive_misses_, corr);
+                    if (kSyncTrace)
+                        fprintf(stderr, "[%zu] LOCKED: sync MISS #%d (corr=%.3f)\n", 
+                                sym_idx, consecutive_misses_, corr);
                     
                     if (consecutive_misses_ >= SYNC_MISS_LIMIT) {
                         state_ = SyncState::HUNTING;
                         collecting_payload_ = false;
-                        fprintf(stderr, "[%zu] LOCKED→HUNTING (lost lock)\n", sym_idx);
+                        prev_norm_corr_ = 0.0;   // clear peak history: no stale re-trigger
+                        prev_raw_corr_  = 0.0;
+                        if (kSyncTrace)
+                            fprintf(stderr, "[%zu] LOCKED->HUNTING (lost lock)\n", sym_idx);
                         break;
                     }
                     
@@ -1174,10 +1168,17 @@ private:
     bool collecting_payload_ = false;
     std::vector<double> pending_frame_;  // Collects payload symbols directly
     
-    // Two-sync verification: holds first frame until second sync confirms
-    std::vector<double> verified_frame_;
-    double verified_quality_ = 0.0;
-    
+    // Per-event sync tracing. OFF by default: at 64 channels x 4 hypotheses x
+    // 25 frames/s this would flood stderr and stall the pipeline. The compiler
+    // drops the guarded fprintf branches entirely when false.
+    static constexpr bool kSyncTrace = false;
+
+    // Previous-symbol correlation, for VHDL-style peak detection in HUNTING
+    // (lock on the falling edge after an above-threshold sample, not on the
+    // rising level crossing). Reset to 0 whenever we (re)enter HUNTING.
+    double prev_norm_corr_ = 0.0;
+    double prev_raw_corr_  = 0.0;
+
     size_t symbols_since_sync_;
     double sync_quality_;
     int consecutive_misses_;
@@ -1525,13 +1526,18 @@ public:
                 std::fwrite(&s16, sizeof(s16), 1, soft_dump_);
             }
             for (int h = 0; h < 4; ++h) {
-                // While committed, only the committed tracker runs; the other three
-                // are dead weight until lock is lost (they re-acquire on the next
-                // burst). Skipping their per-symbol correlation is the bulk of the
-                // framing cost once locked.
-                if (committed_ >= 0 && h != committed_) continue;
                 auto res = trk_[h].process(soft[h], total_symbols_ + i);
                 if (!res.frame_ready || res.payload.empty()) continue;
+                // Once committed, only the committed hypothesis is decoded. The
+                // other trackers still RUN every symbol (state machine identical to
+                // the original / VHDL-style re-acquisition), but they also reach
+                // frame_ready at sync and their output is suppressed anyway, so the
+                // redundant Viterbi is skipped here. Output-identical to original.
+                // (Freezing the non-committed trackers while locked -- "tracker
+                // idle" -- was measured at only ~1.06x and changed re-acquisition,
+                // so it is intentionally NOT done; re-add only after dedicated
+                // multi-burst validation.)
+                if (committed_ >= 0 && h != committed_) continue;
                 Frame f;
                 int metric = fdec_.decode(res.payload.data(), f.bytes);
                 if (metric < 0) continue;
