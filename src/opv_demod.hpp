@@ -569,6 +569,8 @@ public:
     // ====================================================================
     void set_nominal_sps(double sps) { sps_nom_ = sps; recompute_corr_consts(); }
     void set_ted_decim(int d) { ted_decim_ = (d < 1) ? 1 : d; }
+    void set_mf_taps(int m)   { mf_taps_ = (m < 0) ? 0 : m; recompute_corr_consts(); }
+    int  get_mf_taps() const  { return cc_M_; }
     int  get_ted_decim() const { return ted_decim_; }
     double get_nominal_sps() const { return sps_nom_; }
 
@@ -602,8 +604,11 @@ public:
         // independent float MAC the compiler/NEON can vectorize. cos/sin stay in
         // double (the phase argument grows large); the loop and Y are float/double.
         const double ph   = base + strm_abs_base_;
-        const std::complex<float> lo1_0((float)std::cos(cc_inc1_*ph), (float)std::sin(cc_inc1_*ph));
-        const std::complex<float> lo2_0((float)std::cos(cc_inc2_*ph), (float)std::sin(cc_inc2_*ph));
+        double c1, sn1, c2, sn2;
+        __builtin_sincos(cc_inc1_*ph, &sn1, &c1);   // one sincos per tone, not cos+sin
+        __builtin_sincos(cc_inc2_*ph, &sn2, &c2);
+        const std::complex<float> lo1_0((float)c1, (float)sn1);
+        const std::complex<float> lo2_0((float)c2, (float)sn2);
         const std::complex<float>* __restrict wp1 = cc_wpow1_.data();
         const std::complex<float>* __restrict wp2 = cc_wpow2_.data();
         std::complex<float> s1(0.f, 0.f), s2(0.f, 0.f);
@@ -743,7 +748,9 @@ public:
             strm_symctr_++;
 
             // decision-switched Costas (streaming) -> de-rotated arms
-            std::complex<double> rot(std::cos(cb_theta_), -std::sin(cb_theta_));
+            double cth, sth;
+            __builtin_sincos(cb_theta_, &sth, &cth);
+            std::complex<double> rot(cth, -sth);
             std::complex<double> y1 = Y1*rot, y2 = Y2*rot;
             double Xk = y1.imag(), Yvk = y2.imag();
             const std::complex<double>& act = (std::norm(y2) > std::norm(y1)) ? y2 : y1;
@@ -830,6 +837,7 @@ private:
 
     // Fractional-timing front-end state / parameters
     static constexpr int MF_M = 12;     // matched-filter sub-sample FLOOR (adaptive: max(12, round(sps)))
+    int    mf_taps_   = 0;              // 0 = adaptive max(MF_M, round(sps)); >0 = force this M
     double sps_nom_   = (double)SAMPLES_PER_SYMBOL;  // nominal samples/symbol (40 default)
     double el_offset_ = 0.5;               // early-late spacing, samples
     double ted_slope_ = 0.018;             // measured normalized TED gain (err / sample)
@@ -849,7 +857,8 @@ private:
         const double Fs = sps_nom_ * SYMBOL_RATE;
         cc_inc1_ = TWO_PI * (-FREQ_DEV + freq_offset_) / Fs;
         cc_inc2_ = TWO_PI * (+FREQ_DEV + freq_offset_) / Fs;
-        cc_M_    = std::max(MF_M, (int)std::lround(sps_nom_));   // >=1 sub-sample/sample
+        cc_M_    = (mf_taps_ > 0) ? mf_taps_
+                                  : std::max(MF_M, (int)std::lround(sps_nom_));   // >=1 sub-sample/sample
         cc_step_ = sps_nom_ / (double)cc_M_;
         cc_w1_   = std::complex<double>(std::cos(cc_inc1_*cc_step_), std::sin(cc_inc1_*cc_step_));
         cc_w2_   = std::complex<double>(std::cos(cc_inc2_*cc_step_), std::sin(cc_inc2_*cc_step_));
@@ -1194,51 +1203,72 @@ inline size_t deinterleave_addr(size_t idx) {
 //------------------------------------------------------------------------------
 class ViterbiDecoder {
 public:
+    ViterbiDecoder() {
+        // The trellis is fixed by the generator polynomials, so the predecessors
+        // and the expected-symbol parities for every state are constant for all
+        // timesteps and all frames. Build them once here instead of recomputing
+        // 4 parities x 64 states x 1072 steps inside the hot loop.
+        for (int s = 0; s < NUM_STATES; ++s) {
+            int p0 = s / 2, in = s % 2;
+            int f0 = (in << 6) | p0, f1 = (in << 6) | (p0 + 32);
+            int e1_0 = __builtin_parity(f0 & G1_MASK), e2_0 = __builtin_parity(f0 & G2_MASK);
+            int e1_1 = __builtin_parity(f1 & G1_MASK), e2_1 = __builtin_parity(f1 & G2_MASK);
+            pred0_[s] = static_cast<uint8_t>(p0);
+            pred1_[s] = static_cast<uint8_t>(p0 + 32);
+            pat0_[s]  = static_cast<uint8_t>((e1_0 << 1) | e2_0);  // 2-bit branch-metric index
+            pat1_[s]  = static_cast<uint8_t>((e1_1 << 1) | e2_1);
+        }
+        decisions_.resize(FRAME_BITS);
+    }
+
     int decode(const std::array<int, ENCODED_BITS>& soft_in,
                std::array<uint8_t, FRAME_BITS>& bits_out) {
-        std::array<int, NUM_STATES> metrics;
-        metrics.fill(0x7FFFFFFF);
-        metrics[0] = 0;
-        
-        std::vector<std::array<uint8_t, NUM_STATES>> decisions(FRAME_BITS);
-        
+        int buf0[NUM_STATES], buf1[NUM_STATES];
+        int* cur = buf0;
+        int* nxt = buf1;
+        for (int s = 0; s < NUM_STATES; ++s) cur[s] = 0x7FFFFFFF;
+        cur[0] = 0;
+
         for (size_t t = 0; t < FRAME_BITS; ++t) {
-            int sg1 = soft_in[t * 2], sg2 = soft_in[t * 2 + 1];
-            std::array<int, NUM_STATES> next;
-            next.fill(0x7FFFFFFF);
-            
+            const int sg1 = soft_in[t * 2], sg2 = soft_in[t * 2 + 1];
+            // Four possible branch metrics for this symbol pair, indexed by the
+            // 2-bit expected-symbol pattern (e1<<1)|e2 -- same values the old
+            // per-state conditional produced, just shared across all 64 states.
+            const int bmtab[4] = {
+                sg1 + sg2,                              // 00
+                sg1 + (SOFT_MAX - sg2),                 // 01
+                (SOFT_MAX - sg1) + sg2,                 // 10
+                (SOFT_MAX - sg1) + (SOFT_MAX - sg2)     // 11
+            };
+            auto& dec = decisions_[t];
+
             for (int s = 0; s < NUM_STATES; ++s) {
-                int p0 = s / 2, p1 = p0 + 32;
-                int in = s % 2;
-                
-                int f0 = (in << 6) | p0, f1 = (in << 6) | p1;
-                int e1_0 = __builtin_parity(f0 & G1_MASK), e2_0 = __builtin_parity(f0 & G2_MASK);
-                int e1_1 = __builtin_parity(f1 & G1_MASK), e2_1 = __builtin_parity(f1 & G2_MASK);
-                
-                int bm0 = (e1_0 ? SOFT_MAX - sg1 : sg1) + (e2_0 ? SOFT_MAX - sg2 : sg2);
-                int bm1 = (e1_1 ? SOFT_MAX - sg1 : sg1) + (e2_1 ? SOFT_MAX - sg2 : sg2);
-                
-                int m0 = (metrics[p0] < 0x7FFFFFF0) ? metrics[p0] + bm0 : 0x7FFFFFFF;
-                int m1 = (metrics[p1] < 0x7FFFFFF0) ? metrics[p1] + bm1 : 0x7FFFFFFF;
-                
-                if (m0 <= m1) { next[s] = m0; decisions[t][s] = 0; }
-                else { next[s] = m1; decisions[t][s] = 1; }
+                const int p0 = pred0_[s], p1 = pred1_[s];
+                const int bm0 = bmtab[pat0_[s]], bm1 = bmtab[pat1_[s]];
+                const int m0 = (cur[p0] < 0x7FFFFFF0) ? cur[p0] + bm0 : 0x7FFFFFFF;
+                const int m1 = (cur[p1] < 0x7FFFFFF0) ? cur[p1] + bm1 : 0x7FFFFFFF;
+                if (m0 <= m1) { nxt[s] = m0; dec[s] = 0; }
+                else          { nxt[s] = m1; dec[s] = 1; }
             }
-            metrics = next;
+            std::swap(cur, nxt);   // O(1) pointer swap, not a 64-int copy
         }
-        
+
         int best = 0;
         for (int s = 1; s < NUM_STATES; ++s)
-            if (metrics[s] < metrics[best]) best = s;
-        
+            if (cur[s] < cur[best]) best = s;
+
         int s = best;
         for (int t = FRAME_BITS - 1; t >= 0; --t) {
             bits_out[t] = s % 2;
-            s = (decisions[t][s] == 0) ? s / 2 : s / 2 + 32;
+            s = (decisions_[t][s] == 0) ? s / 2 : s / 2 + 32;
         }
-        
-        return metrics[best];
+
+        return cur[best];
     }
+
+private:
+    std::array<uint8_t, NUM_STATES> pred0_, pred1_, pat0_, pat1_;
+    std::vector<std::array<uint8_t, NUM_STATES>> decisions_;
 };
 
 //------------------------------------------------------------------------------
@@ -1439,6 +1469,8 @@ public:
     void   set_timing_bandwidth(double BnT, double zeta = 0.707) { demod_.set_timing_bandwidth(BnT, zeta); }
     void   set_timing_gains(double a, double b) { demod_.set_timing_gains(a, b); }
     void   set_ted_decim(int d)             { demod_.set_ted_decim(d); }
+    void   set_mf_taps(int m)               { demod_.set_mf_taps(m); }
+    int    get_mf_taps() const              { return demod_.get_mf_taps(); }
 
     // --- status accessors ---
     SyncState sync_state()    const { return trk_[committed_ >= 0 ? committed_ : 0].get_state(); }

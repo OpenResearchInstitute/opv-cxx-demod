@@ -73,6 +73,7 @@ int main(int argc, char* argv[]) {
     bool have_init_offset = false;
     double chan_rate = 0.0;    // >0: channelized sample rate -> fractional-timing coherent front-end
     int    ted_decim = 1;      // -D N: coherent timing-TED update interval (1 = every symbol)
+    int    mf_taps = 0;        // -M N: force matched-filter taps (0 = adaptive)
     
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-q")) quiet = true;
@@ -81,6 +82,7 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "-s")) streaming = true;
         else if (!strcmp(argv[i], "-R") && i + 1 < argc) chan_rate = atof(argv[++i]);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) ted_decim = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-M") && i + 1 < argc) mf_taps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) afc_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pll_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
@@ -131,6 +133,7 @@ int main(int argc, char* argv[]) {
 
         CoherentChannelReceiver rx;
         rx.set_ted_decim(ted_decim);
+        if (mf_taps > 0) rx.set_mf_taps(mf_taps);
         if (chan_rate > 0.0) {
             rx.set_nominal_sps(chan_rate / SYMBOL_RATE);
             if (!quiet)
