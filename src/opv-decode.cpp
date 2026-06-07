@@ -25,9 +25,11 @@
 int main(int argc, char** argv) {
     bool quiet = false, raw = false;
     int  nchan = 0;                    // 0 = single-channel raw int16 stream
+    bool seamB = false;                // -3: framed 3-bit input (fabric m_axis_soft_bit)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "-q")) quiet = true;
         else if (!strcmp(argv[i], "-r")) raw = true;
+        else if (!strcmp(argv[i], "-3")) seamB = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) nchan = atoi(argv[++i]);
     }
 
@@ -46,7 +48,36 @@ int main(int argc, char** argv) {
     size_t total_syms = 0;
     auto t0 = std::chrono::steady_clock::now();
 
-    if (nchan <= 0) {
+    if (seamB) {
+        // Seam B: fabric already framed + 3-bit-quantized (frame_sync_detector_soft
+        // m_axis_soft_bit). Input is back-to-back frames of ENCODED_BITS bytes
+        // (0..7); each complete frame -> decode_soft3. No sync, no SyncTracker --
+        // the deployment path. (Single channel here; multiplexed adds a per-frame
+        // channel tag from TID/TUSER.)
+        FrameDecoder fdec;
+        std::vector<uint8_t> frame(ENCODED_BITS);
+        size_t fill = 0;
+        std::vector<uint8_t> buf(BLK);
+        std::array<uint8_t, FRAME_BYTES> out;
+        while (true) {
+            size_t got = std::fread(buf.data(), 1, BLK, stdin);
+            for (size_t k = 0; k < got; ++k) {
+                frame[fill++] = buf[k];
+                if (fill == ENCODED_BITS) {
+                    int metric = fdec.decode_soft3(frame.data(), out);
+                    total_syms += ENCODED_BITS;
+                    ++frames;
+                    if (metric == 0) ++perfect;
+                    if (!quiet)
+                        fprintf(stderr, "FRAME %4d  metric %4d %s\n",
+                                frames, metric, metric == 0 ? "(perfect)" : "");
+                    if (raw) std::fwrite(out.data(), 1, FRAME_BYTES, stdout);
+                    fill = 0;
+                }
+            }
+            if (got < BLK) break;
+        }
+    } else if (nchan <= 0) {
         // single-channel raw int16 soft stream
         SingleStreamDecodeReceiver rx;
         std::vector<int16_t> buf(BLK);

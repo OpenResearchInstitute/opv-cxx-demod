@@ -1282,23 +1282,41 @@ public:
         for (size_t i = 0; i < ENCODED_BITS; ++i) scale += std::abs(soft[i]);
         scale /= ENCODED_BITS;
         if (scale < 1e-10) return -1;
-        
-        // Quantize
+
+        // Quantize to the 0..SOFT_MAX domain (NASA/CCSDS soft-Viterbi convention)
         std::array<int, ENCODED_BITS> qs;
         for (size_t i = 0; i < ENCODED_BITS; ++i) {
             double n = (-soft[i] / scale) * 3.5 + 3.5;
             qs[i] = std::clamp(int(n + 0.5), 0, SOFT_MAX);
         }
-        
+        return decode_from_qs(qs, out);
+    }
+
+    // Decode directly from pre-quantized 3-bit soft values (0..SOFT_MAX), in the
+    // INTERLEAVED on-air order -- i.e. exactly what the fabric frame_sync_detector
+    // emits on m_axis_soft_bit (SOFT_WIDTH=3, 2144 values/frame). Same metric
+    // convention as the fabric viterbi (expected 0 -> sg, expected 1 -> 7-sg), so
+    // no rescale and no sign flip: the fabric's bytes drop straight in.
+    int decode_soft3(const uint8_t* sg, std::array<uint8_t, FRAME_BYTES>& out) {
+        std::array<int, ENCODED_BITS> qs;
+        for (size_t i = 0; i < ENCODED_BITS; ++i)
+            qs[i] = std::clamp((int)sg[i], 0, SOFT_MAX);
+        return decode_from_qs(qs, out);
+    }
+
+private:
+    // Shared tail: deinterleave -> Viterbi -> pack -> derandomize.
+    int decode_from_qs(const std::array<int, ENCODED_BITS>& qs,
+                       std::array<uint8_t, FRAME_BYTES>& out) {
         // Deinterleave
         std::array<int, ENCODED_BITS> deint;
         for (size_t i = 0; i < ENCODED_BITS; ++i)
             deint[i] = qs[deinterleave_addr(i)];
-        
+
         // Viterbi
         std::array<uint8_t, FRAME_BITS> bits;
         int metric = vit_.decode(deint, bits);
-        
+
         // Pack
         std::array<uint8_t, FRAME_BYTES> packed;
         for (size_t i = 0; i < FRAME_BYTES; ++i) {
@@ -1307,7 +1325,7 @@ public:
                 b |= bits[FRAME_BITS - 1 - i * 8 - j] << j;
             packed[i] = b;
         }
-        
+
         // Derandomize
         uint8_t lfsr = 0xFF;
         for (size_t i = 0; i < FRAME_BYTES; ++i) {
@@ -1318,9 +1336,10 @@ public:
             }
             out[i] = packed[i] ^ r;
         }
-        
         return metric;
     }
+
+public:
 
 private:
     ViterbiDecoder vit_;
