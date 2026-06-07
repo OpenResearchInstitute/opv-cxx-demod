@@ -1500,6 +1500,11 @@ public:
         const size_t nsym = std::min(dec0.size(), dec1.size());
         for (size_t i = 0; i < nsym; ++i) {
             const double soft[4] = { dec0[i], -dec0[i], dec1[i], -dec1[i] };
+            if (soft_dump_) {                       // tap: emit a fabric-like single soft stream
+                int v = (int)std::lround(dec0[i] * soft_dump_scale_);
+                int16_t s16 = (int16_t)std::clamp(v, -32768, 32767);
+                std::fwrite(&s16, sizeof(s16), 1, soft_dump_);
+            }
             for (int h = 0; h < 4; ++h) {
                 // While committed, only the committed tracker runs; the other three
                 // are dead weight until lock is lost (they re-acquire on the next
@@ -1547,6 +1552,7 @@ public:
 
     double frontend_secs() const { return t_frontend_; }   // demodulate_stream (corr_at + Costas + 2T)
     double framing_secs()  const { return t_framing_;  }    // 4 trackers + FEC decode
+    void   set_soft_dump(std::FILE* f, double scale = 2000.0) { soft_dump_ = f; soft_dump_scale_ = scale; }
 
     std::vector<Frame> process(const sample_t* samples, size_t n, bool gate = true) {
         std::vector<Frame> frames;
@@ -1567,4 +1573,98 @@ private:
     int                    committed_     = -1;   // resolved hypothesis (-1 = re-resolving)
     double                 t_frontend_    = 0.0;  // instrumentation: front-end seconds
     double                 t_framing_     = 0.0;  // instrumentation: framing+decode seconds
+    std::FILE*             soft_dump_     = nullptr;  // optional: tap dec0 as int16 soft stream
+    double                 soft_dump_scale_ = 2000.0;
+};
+
+//------------------------------------------------------------------------------
+// SingleStreamDecodeReceiver -- decode-only path for the fabric-demod split.
+//
+// In the ZCU102 deployment the PL does channelizer -> MSK demod -> ONE
+// differentially-decoded soft stream per channel (polarity already resolved in
+// fabric, so there is no parity/polarity ambiguity to chase here). This class is
+// the A53 side of that split: a single SyncTracker plus the FrameDecoder, fed
+// soft symbols directly. No demodulator, no symbol-lock gating (the fabric emits
+// only valid symbols via rx_dvalid), and crucially none of the 4-hypothesis
+// commit machinery the coherent CoherentChannelReceiver needs -- that is the
+// "extra work" the fabric resolves upstream, and dropping it is what lifts the
+// A53 to ~24 decode-channels/core.
+//
+// Feed it the int16 soft metric (fabric rx_data_soft) per symbol; it emits a
+// Frame the instant one completes.
+//------------------------------------------------------------------------------
+class SingleStreamDecodeReceiver {
+public:
+    struct Frame {
+        std::array<uint8_t, FRAME_BYTES> bytes;  // decoded 134-byte frame
+        int    metric       = -1;                // FEC metric (0 = perfect)
+        double sync_quality = 0.0;               // sync correlation at capture
+        int    channel      = -1;                // source channel (demux tag)
+    };
+
+    explicit SingleStreamDecodeReceiver(int channel = -1) : channel_(channel) {
+        tracker_.set_symbol_lock(true);          // fabric gates with rx_dvalid; symbols here are valid
+    }
+
+    // Feed one soft symbol from fabric. Sign convention is the fabric contract:
+    // positive soft_val must correspond to the same hard bit FrameDecoder's
+    // quantizer expects (verify against a real fabric vector; invert at the
+    // source if it decodes inverted). Emits via on_frame the moment a frame
+    // completes.
+    template <class OnFrame>
+    void push(double soft_val, OnFrame&& on_frame) {
+        auto res = tracker_.process(soft_val, total_symbols_++);
+        if (res.frame_ready && !res.payload.empty()) {
+            Frame f;
+            int metric = fdec_.decode(res.payload.data(), f.bytes);
+            if (metric >= 0) {
+                f.metric       = metric;
+                f.sync_quality = res.sync_quality;
+                f.channel      = channel_;
+                on_frame(static_cast<const Frame&>(f));
+            }
+        }
+    }
+
+    // Block convenience: feed a run of int16 soft metrics (one channel's symbols).
+    template <class OnFrame>
+    void push_block(const int16_t* soft, size_t n, OnFrame&& on_frame) {
+        for (size_t i = 0; i < n; ++i) push(static_cast<double>(soft[i]), on_frame);
+    }
+
+    SyncState sync_state()    const { return tracker_.get_state(); }
+    size_t    total_symbols() const { return total_symbols_; }
+    int       channel()       const { return channel_; }
+
+private:
+    SyncTracker  tracker_;
+    FrameDecoder fdec_;
+    size_t       total_symbols_ = 0;
+    int          channel_       = -1;
+};
+
+//------------------------------------------------------------------------------
+// DecodeBank -- demultiplexes the multiplexed, channel-tagged fabric soft stream
+// into N per-channel SingleStreamDecodeReceivers. The fabric demod is shared/
+// time-multiplexed across channels (like the channelizer), so it emits
+// (channel_id, soft, valid) rather than N parallel streams; this routes each
+// tagged sample to its channel's decoder.
+//------------------------------------------------------------------------------
+class DecodeBank {
+public:
+    explicit DecodeBank(int num_channels) {
+        rx_.reserve(num_channels);
+        for (int c = 0; c < num_channels; ++c) rx_.emplace_back(c);
+    }
+    // Route one tagged soft sample from the multiplexed fabric stream.
+    template <class OnFrame>
+    void push(int channel, double soft_val, OnFrame&& on_frame) {
+        if (channel >= 0 && channel < (int)rx_.size())
+            rx_[channel].push(soft_val, std::forward<OnFrame>(on_frame));
+    }
+    size_t channels() const { return rx_.size(); }
+    SingleStreamDecodeReceiver& channel(int c) { return rx_[c]; }
+
+private:
+    std::vector<SingleStreamDecodeReceiver> rx_;
 };

@@ -74,6 +74,7 @@ int main(int argc, char* argv[]) {
     double chan_rate = 0.0;    // >0: channelized sample rate -> fractional-timing coherent front-end
     int    ted_decim = 1;      // -D N: coherent timing-TED update interval (1 = every symbol)
     int    mf_taps = 0;        // -M N: force matched-filter taps (0 = adaptive)
+    const char* soft_dump_path = nullptr;  // -X file: tap dec0 as int16 soft stream
     
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-q")) quiet = true;
@@ -83,6 +84,7 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "-R") && i + 1 < argc) chan_rate = atof(argv[++i]);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) ted_decim = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mf_taps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-X") && i + 1 < argc) soft_dump_path = argv[++i];
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) afc_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pll_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
@@ -134,6 +136,12 @@ int main(int argc, char* argv[]) {
         CoherentChannelReceiver rx;
         rx.set_ted_decim(ted_decim);
         if (mf_taps > 0) rx.set_mf_taps(mf_taps);
+        std::FILE* soft_dump_fp = nullptr;
+        if (soft_dump_path) {
+            soft_dump_fp = std::fopen(soft_dump_path, "wb");
+            if (soft_dump_fp) rx.set_soft_dump(soft_dump_fp);
+            else fprintf(stderr, "warning: could not open soft-dump file %s\n", soft_dump_path);
+        }
         if (chan_rate > 0.0) {
             rx.set_nominal_sps(chan_rate / SYMBOL_RATE);
             if (!quiet)
