@@ -27,6 +27,7 @@
 #include <cstring>
 #include <string>
 #include <cstdio>
+#include <chrono>
 //------------------------------------------------------------------------------
 // Constants
 //------------------------------------------------------------------------------
@@ -444,7 +445,7 @@ public:
           // gains; set_pll_bandwidth() (called from the driver) still writes them.
           pll_alpha_(0.01),
           pll_beta_(0.001)
-    {}
+    { recompute_corr_consts(); }
     
     // Estimate carrier offset from spectrum (coarse AFC) - same as non-coherent
     // ---- iterative radix-2 FFT (in-place, N a power of two) ----
@@ -519,7 +520,7 @@ public:
         return -bestf;                                   // reference correction
     }
     
-    void set_freq_offset(double offset) { freq_offset_ = offset; }
+    void set_freq_offset(double offset) { freq_offset_ = offset; recompute_corr_consts(); }
     
     // Front-end (batch / native 40 sps): per-symbol tone correlations over fixed
     // integer windows, continuous-phase reference. Active tone lands its energy
@@ -566,7 +567,9 @@ public:
     // recovered instants -- the SAME quantities the batch path builds -- so the
     // existing Costas + Massey + parity back-end consumes them unchanged.
     // ====================================================================
-    void set_nominal_sps(double sps) { sps_nom_ = sps; }
+    void set_nominal_sps(double sps) { sps_nom_ = sps; recompute_corr_consts(); }
+    void set_ted_decim(int d) { ted_decim_ = (d < 1) ? 1 : d; }
+    int  get_ted_decim() const { return ted_decim_; }
     double get_nominal_sps() const { return sps_nom_; }
 
     // Design the PI timing loop from a normalized loop bandwidth (Bn*T) and
@@ -585,28 +588,32 @@ public:
     // (lo = e^{+j inc n}; Y = sum s*lo) but at fractional positions.
     void corr_at(const sample_t* s, size_t n, double base,
                  std::complex<double>& Y1, std::complex<double>& Y2) const {
-        const double Fs   = sps_nom_ * SYMBOL_RATE;
-        const double inc1 = TWO_PI * (-FREQ_DEV + freq_offset_) / Fs;
-        const double inc2 = TWO_PI * (+FREQ_DEV + freq_offset_) / Fs;
-        const int    M    = std::max(MF_M, (int)std::lround(sps_nom_)); // >=1 sub-sample/sample
-        const double step = sps_nom_ / (double)M;
+        // inc1/inc2/M/step and the per-step rotators w1/w2 depend only on
+        // sps_nom_ and freq_offset_ -- loop invariants, cached by
+        // recompute_corr_consts() and refreshed when either setter is called.
+        // Only lo1/lo2 (which depend on the per-call position) are computed here.
+        const int    M    = cc_M_;
+        const double step = cc_step_;
         // LO phase is referenced to the ABSOLUTE sample position (base + the
-        // cumulative streaming offset), not the buffer-local position. This keeps
-        // the tone reference phase-continuous across streaming chunk boundaries;
-        // strm_abs_base_ is 0 for the batch/one-shot path, so they are unaffected.
+        // cumulative streaming offset) so the tone reference is phase-continuous
+        // across streaming chunk boundaries (strm_abs_base_ is 0 for batch).
+        // The phasor lo*_0 is factored OUT of the loop; inside, the cached power
+        // table cc_wpow*[j] replaces the old loop-carried `lo *= w`, leaving an
+        // independent float MAC the compiler/NEON can vectorize. cos/sin stay in
+        // double (the phase argument grows large); the loop and Y are float/double.
         const double ph   = base + strm_abs_base_;
-        std::complex<double> lo1(std::cos(inc1*ph), std::sin(inc1*ph));
-        std::complex<double> lo2(std::cos(inc2*ph), std::sin(inc2*ph));
-        const std::complex<double> w1(std::cos(inc1*step), std::sin(inc1*step));
-        const std::complex<double> w2(std::cos(inc2*step), std::sin(inc2*step));
-        std::complex<double> a1(0,0), a2(0,0);
+        const std::complex<float> lo1_0((float)std::cos(cc_inc1_*ph), (float)std::sin(cc_inc1_*ph));
+        const std::complex<float> lo2_0((float)std::cos(cc_inc2_*ph), (float)std::sin(cc_inc2_*ph));
+        const std::complex<float>* __restrict wp1 = cc_wpow1_.data();
+        const std::complex<float>* __restrict wp2 = cc_wpow2_.data();
+        std::complex<float> s1(0.f, 0.f), s2(0.f, 0.f);
         for (int j = 0; j < M; ++j) {
-            double p = base + j*step;
-            sample_t v = interp_lin(s, p, n);
-            a1 += v*lo1;  a2 += v*lo2;
-            lo1 *= w1;    lo2 *= w2;
+            std::complex<float> v = interp_cubic_f(s, base + j*step, n);
+            s1 += v*wp1[j];  s2 += v*wp2[j];
         }
-        Y1 = a1;  Y2 = a2;
+        std::complex<float> a1 = lo1_0*s1, a2 = lo2_0*s2;
+        Y1 = std::complex<double>(a1.real(), a1.imag());
+        Y2 = std::complex<double>(a2.real(), a2.imag());
     }
 
     // PI timing loop with normalized ML-gradient TED (err = Re{conj(y)*dy/dtau},
@@ -708,21 +715,32 @@ public:
         // the next block where the prepended samples give it clean context.
         const double fwd_margin = sps_nom_ + EL + 4.0;
         while (pos + fwd_margin < (double)n && pos - EL - 1.0 >= 0.0) {
-            std::complex<double> Y1, Y2, Y1e, Y2e, Y1l, Y2l;
-            corr_at(s, n, pos,      Y1,  Y2);
-            corr_at(s, n, pos - EL, Y1e, Y2e);
-            corr_at(s, n, pos + EL, Y1l, Y2l);
+            std::complex<double> Y1, Y2;
+            corr_at(s, n, pos, Y1, Y2);          // on-time gate: needed every symbol
             if (Y1dbg) Y1dbg->push_back(Y1);
             if (Y2dbg) Y2dbg->push_back(Y2);
 
-            // timing TED (normalized ML-gradient on the dominant tone)
-            bool t1 = std::norm(Y1) > std::norm(Y2);
-            std::complex<double> ya = t1 ? Y1 : Y2;
-            std::complex<double> dy = t1 ? (Y1l - Y1e) : (Y2l - Y2e);
-            double terr = (ya.real()*dy.real() + ya.imag()*dy.imag()) / (std::norm(ya) + 1e-9);
-            strm_tfreq_ += beta_t_ * terr;
-            strm_tfreq_  = std::clamp(strm_tfreq_, -0.05, 0.05);
-            double adj = std::clamp(alpha_t_ * terr + strm_tfreq_, -2.0, 2.0);
+            // Timing TED needs the early/late gates (2 extra corr_at). They drive
+            // tracking only, so once running we update every ted_decim_ symbols and
+            // coast on the integral (NCO frequency) between updates -- cutting the
+            // dominant cost toward 1 corr_at/symbol. ted_decim_==1 -> every symbol
+            // (bit-exact with the pre-decimation path).
+            double adj;
+            if (ted_decim_ <= 1 || (strm_symctr_ % (long)ted_decim_) == 0) {
+                std::complex<double> Y1e, Y2e, Y1l, Y2l;
+                corr_at(s, n, pos - EL, Y1e, Y2e);
+                corr_at(s, n, pos + EL, Y1l, Y2l);
+                bool t1 = std::norm(Y1) > std::norm(Y2);
+                std::complex<double> ya = t1 ? Y1 : Y2;
+                std::complex<double> dy = t1 ? (Y1l - Y1e) : (Y2l - Y2e);
+                double terr = (ya.real()*dy.real() + ya.imag()*dy.imag()) / (std::norm(ya) + 1e-9);
+                strm_tfreq_ += beta_t_ * terr;
+                strm_tfreq_  = std::clamp(strm_tfreq_, -0.05, 0.05);
+                adj = std::clamp(alpha_t_ * terr + strm_tfreq_, -2.0, 2.0);
+            } else {
+                adj = std::clamp(strm_tfreq_, -2.0, 2.0);   // coast on the integral
+            }
+            strm_symctr_++;
 
             // decision-switched Costas (streaming) -> de-rotated arms
             std::complex<double> rot(std::cos(cb_theta_), -std::sin(cb_theta_));
@@ -760,10 +778,25 @@ public:
     }
 
     void reset_stream() {
-        strm_init_ = false; strm_tfreq_ = 0.0; strm_abs_base_ = 0.0;
+        strm_init_ = false; strm_tfreq_ = 0.0; strm_abs_base_ = 0.0; strm_symctr_ = 0;
         cb_theta_ = 0.0; cb_cfreq_ = 0.0;
         cb_have_ = false; cb_have2_ = false; cb_idx_ = 0;
         cb_Xp_ = cb_Yvp_ = cb_e0p_ = cb_e1p_ = 0.0;
+    }
+
+    // Float (complex<float>) cubic Catmull-Rom interpolator for the corr_at hot
+    // loop. Indexing/clamping is done in double for positional accuracy; the
+    // sample arithmetic runs in float for NEON lane width + bandwidth on the A53.
+    static std::complex<float> interp_cubic_f(const sample_t* s, double idx, size_t len) {
+        if (idx < 1) idx = 1;
+        if (idx >= (double)(len - 2)) idx = (double)(len - 3);
+        size_t i = (size_t)idx;
+        float f = (float)(idx - (double)i);
+        std::complex<float> a((float)s[i-1].real(), (float)s[i-1].imag());
+        std::complex<float> b((float)s[i  ].real(), (float)s[i  ].imag());
+        std::complex<float> c((float)s[i+1].real(), (float)s[i+1].imag());
+        std::complex<float> d((float)s[i+2].real(), (float)s[i+2].imag());
+        return b + 0.5f*f*(c - a + f*(2.0f*a - 5.0f*b + 4.0f*c - d + f*(3.0f*(b - c) + d - a)));
     }
 
     static sample_t interp_lin(const sample_t* s, double idx, size_t len) {
@@ -803,8 +836,39 @@ private:
     double alpha_t_   = 0.06;              // PI proportional gain (model-validated)
     double beta_t_    = 0.0025;            // PI integral gain
 
+    // Cached corr_at LO constants (loop-invariant in sps_nom_ and freq_offset_).
+    // Refreshed by recompute_corr_consts() from the constructor and the
+    // set_nominal_sps / set_freq_offset setters -- hoisted out of the per-call
+    // (and per-symbol x3-gate) hot path. cc_w1_/cc_w2_ remove 4 trig per call.
+    double               cc_inc1_ = 0.0, cc_inc2_ = 0.0, cc_step_ = 1.0;
+    int                  cc_M_    = MF_M;
+    std::complex<double> cc_w1_{1.0, 0.0}, cc_w2_{1.0, 0.0};
+    std::vector<std::complex<float>> cc_wpow1_, cc_wpow2_;   // w^0..w^(M-1), cached
+
+    void recompute_corr_consts() {
+        const double Fs = sps_nom_ * SYMBOL_RATE;
+        cc_inc1_ = TWO_PI * (-FREQ_DEV + freq_offset_) / Fs;
+        cc_inc2_ = TWO_PI * (+FREQ_DEV + freq_offset_) / Fs;
+        cc_M_    = std::max(MF_M, (int)std::lround(sps_nom_));   // >=1 sub-sample/sample
+        cc_step_ = sps_nom_ / (double)cc_M_;
+        cc_w1_   = std::complex<double>(std::cos(cc_inc1_*cc_step_), std::sin(cc_inc1_*cc_step_));
+        cc_w2_   = std::complex<double>(std::cos(cc_inc2_*cc_step_), std::sin(cc_inc2_*cc_step_));
+        // Per-step phasor power tables w^0..w^(M-1), cached (constant per run).
+        // Factoring the per-call phasor out of corr_at and indexing this table
+        // removes the loop-carried `lo *= w` dependency, so the MAC can vectorize.
+        cc_wpow1_.resize(cc_M_);  cc_wpow2_.resize(cc_M_);
+        std::complex<double> p1(1.0, 0.0), p2(1.0, 0.0);
+        for (int j = 0; j < cc_M_; ++j) {
+            cc_wpow1_[j] = std::complex<float>((float)p1.real(), (float)p1.imag());
+            cc_wpow2_[j] = std::complex<float>((float)p2.real(), (float)p2.imag());
+            p1 *= cc_w1_;  p2 *= cc_w2_;
+        }
+    }
+
     // Streaming (demodulate_stream) state, carried across chunk boundaries.
     bool   strm_init_  = false;            // lazy init of strm_pos_ to EL+1
+    long   strm_symctr_ = 0;               // streaming symbol counter (TED decimation phase)
+    int    ted_decim_  = 1;                // TED update every Nth symbol (1 = every symbol)
     double strm_abs_base_ = 0.0;           // cumulative consumed samples (absolute LO phase ref)
     double strm_pos_   = 0.0;              // fractional timing position within the block
     double strm_tfreq_ = 0.0;              // timing-loop integral (NCO frequency)
@@ -1374,6 +1438,7 @@ public:
     double get_freq_offset() const          { return demod_.get_freq_offset(); }
     void   set_timing_bandwidth(double BnT, double zeta = 0.707) { demod_.set_timing_bandwidth(BnT, zeta); }
     void   set_timing_gains(double a, double b) { demod_.set_timing_gains(a, b); }
+    void   set_ted_decim(int d)             { demod_.set_ted_decim(d); }
 
     // --- status accessors ---
     SyncState sync_state()    const { return trk_[committed_ >= 0 ? committed_ : 0].get_state(); }
@@ -1394,7 +1459,9 @@ public:
 
         std::vector<double> dec0, dec1;
         size_t consumed = 0;
+        auto _t0 = std::chrono::steady_clock::now();
         demod_.demodulate_stream(buf.data(), buf.size(), dec0, dec1, consumed);
+        auto _t1 = std::chrono::steady_clock::now();
         if (consumed > buf.size()) consumed = buf.size();
         leftover_.assign(buf.begin() + consumed, buf.end());
 
@@ -1402,6 +1469,11 @@ public:
         for (size_t i = 0; i < nsym; ++i) {
             const double soft[4] = { dec0[i], -dec0[i], dec1[i], -dec1[i] };
             for (int h = 0; h < 4; ++h) {
+                // While committed, only the committed tracker runs; the other three
+                // are dead weight until lock is lost (they re-acquire on the next
+                // burst). Skipping their per-symbol correlation is the bulk of the
+                // framing cost once locked.
+                if (committed_ >= 0 && h != committed_) continue;
                 auto res = trk_[h].process(soft[h], total_symbols_ + i);
                 if (!res.frame_ready || res.payload.empty()) continue;
                 Frame f;
@@ -1435,8 +1507,14 @@ public:
             if (committed_ >= 0 && trk_[committed_].get_state() == SyncState::HUNTING)
                 committed_ = -1;
         }
+        auto _t2 = std::chrono::steady_clock::now();
+        t_frontend_ += std::chrono::duration<double>(_t1 - _t0).count();
+        t_framing_  += std::chrono::duration<double>(_t2 - _t1).count();
         total_symbols_ += nsym;
     }
+
+    double frontend_secs() const { return t_frontend_; }   // demodulate_stream (corr_at + Costas + 2T)
+    double framing_secs()  const { return t_framing_;  }    // 4 trackers + FEC decode
 
     std::vector<Frame> process(const sample_t* samples, size_t n, bool gate = true) {
         std::vector<Frame> frames;
@@ -1455,4 +1533,6 @@ private:
     std::vector<sample_t>  leftover_;        // un-consumed sample tail (symbol continuity)
     size_t                 total_symbols_ = 0;
     int                    committed_     = -1;   // resolved hypothesis (-1 = re-resolving)
+    double                 t_frontend_    = 0.0;  // instrumentation: front-end seconds
+    double                 t_framing_     = 0.0;  // instrumentation: framing+decode seconds
 };

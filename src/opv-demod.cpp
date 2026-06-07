@@ -72,6 +72,7 @@ int main(int argc, char* argv[]) {
     double init_offset = 0.0;  // Initial frequency offset for streaming mode
     bool have_init_offset = false;
     double chan_rate = 0.0;    // >0: channelized sample rate -> fractional-timing coherent front-end
+    int    ted_decim = 1;      // -D N: coherent timing-TED update interval (1 = every symbol)
     
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-q")) quiet = true;
@@ -79,6 +80,7 @@ int main(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "-c")) coherent = true;
         else if (!strcmp(argv[i], "-s")) streaming = true;
         else if (!strcmp(argv[i], "-R") && i + 1 < argc) chan_rate = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-D") && i + 1 < argc) ted_decim = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) afc_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pll_bw = atof(argv[++i]);
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
@@ -128,6 +130,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Streaming mode (COHERENT): processing data as it arrives...\n\n");
 
         CoherentChannelReceiver rx;
+        rx.set_ted_decim(ted_decim);
         if (chan_rate > 0.0) {
             rx.set_nominal_sps(chan_rate / SYMBOL_RATE);
             if (!quiet)
@@ -156,13 +159,23 @@ int main(int argc, char* argv[]) {
         std::vector<sample_t> chunk_buf;
         chunk_buf.reserve(CHUNK_SAMPLES);
 
-        IQSample iq;
-        while (std::cin.read(reinterpret_cast<char*>(&iq), sizeof(iq))) {
-            chunk_buf.push_back(sample_t(iq.I, iq.Q));
-            if (chunk_buf.size() >= CHUNK_SAMPLES) {
-                rx.process(chunk_buf.data(), chunk_buf.size(), emit);
-                chunk_buf.clear();
+        // Read stdin in big blocks, not one 4-byte sample per istream::read call.
+        // Per-sample reads cost ~0.4s on the A53 purely in sentry/lock overhead;
+        // the live path receives samples in DMA-sized blocks, so model that here.
+        const size_t IO_BLOCK = 65536;          // samples per read
+        std::vector<IQSample> io(IO_BLOCK);
+        while (true) {
+            std::cin.read(reinterpret_cast<char*>(io.data()),
+                          static_cast<std::streamsize>(IO_BLOCK * sizeof(IQSample)));
+            size_t got = static_cast<size_t>(std::cin.gcount()) / sizeof(IQSample);
+            for (size_t k = 0; k < got; ++k) {
+                chunk_buf.push_back(sample_t(io[k].I, io[k].Q));
+                if (chunk_buf.size() >= CHUNK_SAMPLES) {
+                    rx.process(chunk_buf.data(), chunk_buf.size(), emit);
+                    chunk_buf.clear();
+                }
             }
+            if (got < IO_BLOCK) break;
         }
         if (!chunk_buf.empty()) {
             rx.process(chunk_buf.data(), chunk_buf.size(), emit);
@@ -174,6 +187,9 @@ int main(int argc, char* argv[]) {
                     decoded, perfect, decoded - perfect);
             fprintf(stderr, "Total: %zu symbols, locked hypothesis: %d\n",
                     rx.total_symbols(), rx.locked_hyp());
+            double fe = rx.frontend_secs(), fr = rx.framing_secs(), tot = fe + fr + 1e-9;
+            fprintf(stderr, "Profile: front-end %.3fs (%.0f%%)  framing+decode %.3fs (%.0f%%)\n",
+                    fe, 100.0*fe/tot, fr, 100.0*fr/tot);
             fprintf(stderr, "Final state: %s\n", state_name(rx.sync_state()));
             fprintf(stderr, "════════════════════════════════════════════════════════════════════\n");
         }
