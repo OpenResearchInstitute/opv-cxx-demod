@@ -28,6 +28,29 @@
 #include <string>
 #include <cstdio>
 #include <chrono>
+
+//------------------------------------------------------------------------------
+// Portable sincos: one transcendental call per angle on GCC (A53/Linux build);
+// falls back to separate sin/cos on compilers without the builtin (Apple Clang).
+// Identical math either way -- decode results are unaffected, only speed.
+//------------------------------------------------------------------------------
+#if defined(__has_builtin)
+#  if __has_builtin(__builtin_sincos)
+#    define OPV_HAS_BUILTIN_SINCOS 1
+#  endif
+#elif defined(__GNUC__) && !defined(__clang__)
+#  define OPV_HAS_BUILTIN_SINCOS 1
+#endif
+
+static inline void opv_sincos(double x, double* s, double* c) {
+#if defined(OPV_HAS_BUILTIN_SINCOS)
+    __builtin_sincos(x, s, c);
+#else
+    *s = std::sin(x);
+    *c = std::cos(x);
+#endif
+}
+
 //------------------------------------------------------------------------------
 // Constants
 //------------------------------------------------------------------------------
@@ -610,8 +633,8 @@ public:
         // double (the phase argument grows large); the loop and Y are float/double.
         const double ph   = base + strm_abs_base_;
         double c1, sn1, c2, sn2;
-        __builtin_sincos(cc_inc1_*ph, &sn1, &c1);   // one sincos per tone, not cos+sin
-        __builtin_sincos(cc_inc2_*ph, &sn2, &c2);
+        opv_sincos(cc_inc1_*ph, &sn1, &c1);   // one sincos per tone, not cos+sin
+        opv_sincos(cc_inc2_*ph, &sn2, &c2);
         const std::complex<float> lo1_0((float)c1, (float)sn1);
         const std::complex<float> lo2_0((float)c2, (float)sn2);
         const std::complex<float>* __restrict wp1 = cc_wpow1_.data();
@@ -754,7 +777,7 @@ public:
 
             // decision-switched Costas (streaming) -> de-rotated arms
             double cth, sth;
-            __builtin_sincos(cb_theta_, &sth, &cth);
+            opv_sincos(cb_theta_, &sth, &cth);
             std::complex<double> rot(cth, -sth);
             std::complex<double> y1 = Y1*rot, y2 = Y2*rot;
             double Xk = y1.imag(), Yvk = y2.imag();
