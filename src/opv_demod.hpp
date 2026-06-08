@@ -775,17 +775,27 @@ public:
             }
             strm_symctr_++;
 
-            // decision-switched Costas (streaming) -> de-rotated arms
-            double cth, sth;
-            opv_sincos(cb_theta_, &sth, &cth);
-            std::complex<double> rot(cth, -sth);
-            std::complex<double> y1 = Y1*rot, y2 = Y2*rot;
+            // decision-switched Costas (streaming) -> de-rotated arms.
+            // TWO DECOUPLED per-tone carrier loops: the two MSK tones share carrier
+            // frequency but sit at a constant phase offset, so a single switched
+            // accumulator cannot lock both. Track each tone's phase independently.
+            double cth1, sth1, cth2, sth2;
+            opv_sincos(cb_theta_,  &sth1, &cth1);
+            opv_sincos(cb_theta2_, &sth2, &cth2);
+            std::complex<double> y1 = Y1*std::complex<double>(cth1, -sth1);
+            std::complex<double> y2 = Y2*std::complex<double>(cth2, -sth2);
             double Xk = y1.imag(), Yvk = y2.imag();
-            const std::complex<double>& act = (std::norm(y2) > std::norm(y1)) ? y2 : y1;
-            double m = std::abs(act) + 1e-9;
-            double cerr = -(act.real() * ((act.imag() < 0) ? -1.0 : 1.0)) / m;
-            cb_cfreq_ += 2e-4 * cerr;
-            cb_theta_ += 0.01 * cerr + cb_cfreq_;
+            if (std::norm(y2) > std::norm(y1)) {
+                double m = std::abs(y2) + 1e-9;
+                double cerr = -(y2.real() * ((y2.imag() < 0) ? -1.0 : 1.0)) / m;
+                cb_cfreq2_ += 2e-4 * cerr;  cb_theta2_ += 0.01 * cerr;
+            } else {
+                double m = std::abs(y1) + 1e-9;
+                double cerr = -(y1.real() * ((y1.imag() < 0) ? -1.0 : 1.0)) / m;
+                cb_cfreq_  += 2e-4 * cerr;  cb_theta_  += 0.01 * cerr;
+            }
+            cb_theta_  += cb_cfreq_;   // free-run both every symbol
+            cb_theta2_ += cb_cfreq2_;
 
             // 2T combine + soft-differential, one-symbol delayed (needs X[k+1]).
             if (cb_have_) {
@@ -815,6 +825,7 @@ public:
     void reset_stream() {
         strm_init_ = false; strm_tfreq_ = 0.0; strm_abs_base_ = 0.0; strm_symctr_ = 0;
         cb_theta_ = 0.0; cb_cfreq_ = 0.0;
+        cb_theta2_ = 0.0; cb_cfreq2_ = 0.0;
         cb_have_ = false; cb_have2_ = false; cb_idx_ = 0;
         cb_Xp_ = cb_Yvp_ = cb_e0p_ = cb_e1p_ = 0.0;
     }
@@ -910,6 +921,8 @@ private:
     double strm_pos_   = 0.0;              // fractional timing position within the block
     double strm_tfreq_ = 0.0;              // timing-loop integral (NCO frequency)
     double cb_theta_   = 0.0;              // Costas phase accumulator
+    double cb_theta2_  = 0.0;              // Costas phase accumulator, tone2
+    double cb_cfreq2_  = 0.0;              // Costas frequency integral, tone2
     double cb_cfreq_   = 0.0;              // Costas frequency integral
     bool   cb_have_    = false;            // a prior symbol's X/Yv is held (for 2T pairing)
     bool   cb_have2_   = false;            // a prior enc is held (for soft-differential)
