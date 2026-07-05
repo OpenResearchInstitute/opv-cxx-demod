@@ -91,8 +91,8 @@ constexpr double TWO_PI = 2.0 * PI;
 constexpr double F1_FREQ = -FREQ_DEV;
 constexpr double F2_FREQ = +FREQ_DEV;
 
-constexpr uint8_t G1_MASK = 0x4F;
-constexpr uint8_t G2_MASK = 0x6D;
+constexpr uint8_t G1_MASK = 0x67;  // 171 octal, delays {0,1,2,3,6} (was 0x4F=174, WRONG)
+constexpr uint8_t G2_MASK = 0x76;  // 133 octal, delays {0,2,3,5,6} (was 0x6D=155, WRONG)
 
 // Session management (matches Dialogus behavior)
 constexpr size_t OVP_HEADER_SIZE = 12;        // station ID(6) + token(3) + reserved(3)

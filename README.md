@@ -62,7 +62,13 @@ make test-coherent                  # coherent loopback self-test
 
 ## Channel Coding
 
-- **Convolutional Code**: Rate 1/2, K=7 (G1 = 0x4F, G2 = 0x6D)
+- **Convolutional Code**: Rate 1/2, K=7. Generators **G1 = 171, G2 = 133
+  (octal)** — the NASA/Voyager/CCSDS standard, also used in 802.11 — with free
+  distance **d_free = 10** (≈5 dB soft-decision coding gain, ≈7 dB asymptotic).
+  In `opv-mod.cpp` / `opv_demod.hpp` these are parity masks `0x67` / `0x76` for
+  the `state = (in << 6) | sr` shift-register layout — **not** `0x79` / `0x5B`,
+  which is a different (weaker) code under this layout. Ground truth is the
+  impulse response: a single `1` encodes to `g1 = 1111001`, `g2 = 1011011`.
 - **Interleaver**: 67×32 block with bit reversal
 - **Randomizer**: CCSDS 8-bit LFSR (x⁸+x⁷+x⁵+x³+1)
 

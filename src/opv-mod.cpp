@@ -131,10 +131,10 @@ public:
     void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
         uint8_t state = (in << 6) | sr;
         // HDL uses 6-i indexing, so:
-        // G1 = 171 octal = 1111001 -> mask = 0x4F
-        // G2 = 133 octal = 1011011 -> mask = 0x6D
-        g1 = __builtin_parity(state & 0x4F);
-        g2 = __builtin_parity(state & 0x6D);
+        // G1 = 171 octal = 1111001 -> mask = 0x67
+        // G2 = 133 octal = 1011011 -> mask = 0x76
+        g1 = __builtin_parity(state & 0x67);
+        g2 = __builtin_parity(state & 0x76);
         sr = ((sr << 1) | in) & 0x3F;
     }
     
@@ -488,7 +488,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Frames:   " << bert_frames << "\n";
         }
         std::cerr << "  Preamble: " << (preamble ? "yes (0xCC x2168)" : "no") << "\n";
-        std::cerr << "  Conv encoder: G1=0x4F, G2=0x6D\n";
+        std::cerr << "  Conv encoder: G1=0x67 (171), G2=0x76 (133)\n";
         std::cerr << "\n";
     }
     

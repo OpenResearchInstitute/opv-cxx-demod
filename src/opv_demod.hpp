@@ -70,8 +70,8 @@ constexpr size_t ENCODED_BITS = FRAME_BITS * 2;
 constexpr size_t FRAME_SYMBOLS = SYNC_BITS + ENCODED_BITS;
 
 constexpr int SOFT_MAX = 7;
-constexpr uint8_t G1_MASK = 0x4F;
-constexpr uint8_t G2_MASK = 0x6D;
+constexpr uint8_t G1_MASK = 0x67;  // 171 octal, delays {0,1,2,3,6} (was 0x4F=174, WRONG)
+constexpr uint8_t G2_MASK = 0x76;  // 133 octal, delays {0,2,3,5,6} (was 0x6D=155, WRONG)
 constexpr int NUM_STATES = 64;
 
 // Sync thresholds
