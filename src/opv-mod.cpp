@@ -28,14 +28,12 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <cassert>
+#include "opv_codec.hpp"
 
 // =============================================================================
 // PARAMETERS
 // =============================================================================
 
-constexpr size_t FRAME_BYTES = 134;
-constexpr size_t FRAME_BITS = FRAME_BYTES * 8;
-constexpr size_t ENCODED_BITS = FRAME_BITS * 2;
 
 constexpr uint32_t SYNC_WORD = 0x02B8DB;
 
@@ -55,8 +53,6 @@ constexpr double TWO_PI = 2.0 * PI;
 // TYPES
 // =============================================================================
 
-using frame_t = std::array<uint8_t, FRAME_BYTES>;
-using encoded_bits_t = std::array<uint8_t, ENCODED_BITS>;
 
 struct IQSample { int16_t I, Q; };
 
@@ -102,139 +98,22 @@ private:
 // CCSDS LFSR RANDOMIZER
 // =============================================================================
 
-class LFSR {
-public:
-    void reset() { state = 0xFF; }
-    
-    uint8_t next_byte() {
-        uint8_t out = 0;
-        for (int i = 7; i >= 0; --i) {
-            out |= ((state >> 7) & 1) << i;
-            uint8_t fb = ((state >> 7) ^ (state >> 6) ^ (state >> 4) ^ (state >> 2)) & 1;
-            state = (state << 1) | fb;
-        }
-        return out;
-    }
-    
-private:
-    uint8_t state = 0xFF;
-};
 
 // =============================================================================
 // CONVOLUTIONAL ENCODER (K=7, Rate 1/2)
 // Uses correct polynomial masks matching HDL's bit indexing
 // =============================================================================
 
-class ConvEncoder {
-public:
-    void reset() { sr = 0; }
-    uint8_t get_state() const { return sr; }    
-    void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
-        uint8_t state = (in << 6) | sr;
-        // HDL uses 6-i indexing, so:
-        // G1 = 171 octal = 1111001 -> mask = 0x67
-        // G2 = 133 octal = 1011011 -> mask = 0x76
-        g1 = __builtin_parity(state & 0x67);
-        g2 = __builtin_parity(state & 0x76);
-        sr = ((sr << 1) | in) & 0x3F;
-    }
-    
-private:
-    uint8_t sr = 0;
-};
 
 // =============================================================================
 // 67x32 BIT INTERLEAVER (with MSB-first byte correction to match HDL)
 // =============================================================================
 
-void interleave(encoded_bits_t& bits) {
-    encoded_bits_t temp = {};
-    for (size_t i = 0; i < ENCODED_BITS; ++i) {
-        size_t interleaved_pos = (i % 32) * 67 + (i / 32);
-        // Apply MSB-first byte correction (same as demodulator expects)
-        size_t byte_num = interleaved_pos / 8;
-        size_t bit_in_byte = interleaved_pos % 8;
-        size_t corrected_pos = byte_num * 8 + (7 - bit_in_byte);
-        temp[corrected_pos] = bits[i];
-    }
-    bits = temp;
-}
 
 // =============================================================================
 // FRAME ENCODER
 // =============================================================================
 
-encoded_bits_t encode_frame(const frame_t& payload) {
-    LFSR lfsr; lfsr.reset();
-    ConvEncoder conv;              // was: ConvEncoder conv; conv.reset();
-    encoded_bits_t encoded = {};
-    // (delete the early  size_t out_idx = 0;  line — we declare it before pass 2)
-    
-    // Randomize payload
-    std::array<uint8_t, FRAME_BYTES> randomized;
-    for (size_t i = 0; i < FRAME_BYTES; ++i) {
-        randomized[i] = payload[i] ^ lfsr.next_byte();
-    }
-    
-    if (g_verbose) {
-        std::cerr << "Payload[0:11]: ";
-        for (int i = 0; i < 12; ++i) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)payload[i] << " ";
-        }
-        std::cerr << std::dec << "\n";
-        
-        std::cerr << "Randomized[0:5]: ";
-        for (int i = 0; i < 6; ++i) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)randomized[i] << " ";
-        }
-        std::cerr << std::dec << "\n";
-    }
-    
-
-    // ---- TAIL-BITING pass 1: encode from zero to DISCOVER the end state ----
-    // (outputs discarded). Seeding the start with this makes start == end, so the
-    // trellis closes into a ring: no unterminated tail, no tail-floor.
-    conv.reset();
-    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx)
-        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
-            uint8_t g1, g2;
-            conv.encode_bit((randomized[byte_idx] >> bit_pos) & 1, g1, g2);
-        }
-    uint8_t seed = conv.get_state();      // = tail-biting start state
-
-    // ---- pass 2: the real encode, continuing from the seeded state (NO reset) ----
-    size_t out_idx = 0;
-    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx)
-        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
-            uint8_t g1, g2;
-            conv.encode_bit((randomized[byte_idx] >> bit_pos) & 1, g1, g2);
-            encoded[out_idx++] = g1;
-            encoded[out_idx++] = g2;
-        }
-    assert(conv.get_state() == seed);     // ring-closure check — see below
-
-
-    if (g_verbose)
-        std::cerr << "TAILBITE: seed=" << (int)seed
-                  << " end=" << (int)conv.get_state() << "\n";
-
-    
-    if (g_verbose) {
-        std::cerr << "Before interleave [0:31]: ";
-        for (int i = 0; i < 32; ++i) std::cerr << (int)encoded[i];
-        std::cerr << "\n";
-    }
-    
-    interleave(encoded);
-    
-    if (g_verbose) {
-        std::cerr << "After interleave [0:31]:  ";
-        for (int i = 0; i < 32; ++i) std::cerr << (int)encoded[i];
-        std::cerr << "\n";
-    }
-    
-    return encoded;
-}
 
 // =============================================================================
 // HDL-ACCURATE PARALLEL-TONE MSK MODULATOR

@@ -40,7 +40,7 @@
  * SPDX-License-Identifier: CERN-OHL-S-2.0
  */
 
-#include <cassert>
+#include "opv_codec.hpp"
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
@@ -74,9 +74,6 @@
 // PARAMETERS
 // =============================================================================
 
-constexpr size_t FRAME_BYTES = 134;
-constexpr size_t FRAME_BITS = FRAME_BYTES * 8;
-constexpr size_t ENCODED_BITS = FRAME_BITS * 2;
 
 constexpr uint32_t SYNC_WORD = 0x02B8DB;
 constexpr size_t SYNC_BITS = 24;
@@ -92,8 +89,6 @@ constexpr double TWO_PI = 2.0 * PI;
 constexpr double F1_FREQ = -FREQ_DEV;
 constexpr double F2_FREQ = +FREQ_DEV;
 
-constexpr uint8_t G1_MASK = 0x67;  // 171 octal, delays {0,1,2,3,6} (was 0x4F=174, WRONG)
-constexpr uint8_t G2_MASK = 0x76;  // 133 octal, delays {0,2,3,5,6} (was 0x6D=155, WRONG)
 
 // Session management (matches Dialogus behavior)
 constexpr size_t OVP_HEADER_SIZE = 12;        // station ID(6) + token(3) + reserved(3)
@@ -106,8 +101,6 @@ constexpr int    IDLE_POLL_TIMEOUT_MS = 100;  // poll timeout when idle
 // TYPES
 // =============================================================================
 
-using frame_t = std::array<uint8_t, FRAME_BYTES>;
-using encoded_bits_t = std::array<uint8_t, ENCODED_BITS>;
 
 struct IQSample { int16_t I, Q; };
 
@@ -183,101 +176,21 @@ bool encode_base40(const std::string& callsign, uint8_t* bytes) {
 // CCSDS LFSR RANDOMIZER
 // =============================================================================
 
-class LFSR {
-public:
-    void reset() { state = 0xFF; }
-    
-    uint8_t next_byte() {
-        uint8_t out = 0;
-        for (int i = 7; i >= 0; --i) {
-            out |= ((state >> 7) & 1) << i;
-            uint8_t fb = ((state >> 7) ^ (state >> 6) ^ (state >> 4) ^ (state >> 2)) & 1;
-            state = (state << 1) | fb;
-        }
-        return out;
-    }
-    
-private:
-    uint8_t state = 0xFF;
-};
 
 // =============================================================================
 // CONVOLUTIONAL ENCODER
 // =============================================================================
 
-class ConvEncoder {
-public:
-    void reset() { sr = 0; }
-    uint8_t get_state() const { return sr; }
-    
-    void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
-        uint8_t state = (in << 6) | sr;
-        g1 = __builtin_parity(state & G1_MASK);
-        g2 = __builtin_parity(state & G2_MASK);
-        sr = ((sr << 1) | in) & 0x3F;
-    }
-    
-private:
-    uint8_t sr = 0;
-};
 
 // =============================================================================
 // INTERLEAVER
 // =============================================================================
 
-void interleave(encoded_bits_t& bits) {
-    encoded_bits_t temp = {};
-    for (size_t i = 0; i < ENCODED_BITS; ++i) {
-        size_t interleaved_pos = (i % 32) * 67 + (i / 32);
-        size_t byte_num = interleaved_pos / 8;
-        size_t bit_in_byte = interleaved_pos % 8;
-        size_t corrected_pos = byte_num * 8 + (7 - bit_in_byte);
-        temp[corrected_pos] = bits[i];
-    }
-    bits = temp;
-}
 
 // =============================================================================
 // FRAME ENCODER
 // =============================================================================
 
-encoded_bits_t encode_frame(const frame_t& payload) {
-    LFSR lfsr; lfsr.reset();
-    ConvEncoder conv;
-    encoded_bits_t encoded = {};
-    
-    std::array<uint8_t, FRAME_BYTES> randomized;
-    for (size_t i = 0; i < FRAME_BYTES; ++i) {
-        randomized[i] = payload[i] ^ lfsr.next_byte();
-    }
-    
-    // ---- TAIL-BITING pass 1: encode from zero to discover the end state (discard) --
-    conv.reset();
-    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
-        uint8_t byte = randomized[byte_idx];
-        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
-            uint8_t g1, g2;
-            conv.encode_bit((byte >> bit_pos) & 1, g1, g2);
-        }
-    }
-    uint8_t seed = conv.get_state();     // = tail-biting start state
-
-    // ---- pass 2: real encode, continuing from the seeded state (NO reset) --------
-    size_t out_idx = 0;
-    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
-        uint8_t byte = randomized[byte_idx];
-        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
-            uint8_t g1, g2;
-            conv.encode_bit((byte >> bit_pos) & 1, g1, g2);
-            encoded[out_idx++] = g1;
-            encoded[out_idx++] = g2;
-        }
-    }
-    assert(conv.get_state() == seed);    // ring-closure check
-
-    interleave(encoded);
-    return encoded;
-}
 
 // =============================================================================
 // HDL-ACCURATE MSK MODULATOR

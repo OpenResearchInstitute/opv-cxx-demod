@@ -61,7 +61,7 @@ clean:
 	rm -rf bin
 
 # Basic loopback test (mod → demod)
-test: all
+test: all test-codec
 	@echo "=== Pipe Loopback Test ==="
 	@$(BINDIR)/opv-mod -S W5NYV -B 5 | $(BINDIR)/opv-demod -s 2>&1 | grep -E "Station|Token|Summary"
 
@@ -179,6 +179,16 @@ test-coherent-compare: all
 	   echo "✗ Coherent underperforms at $(SNR) dB SNR, $(OFFSET) Hz offset — investigate"; \
 	 fi
 
+
+test-codec: all
+	@echo "=== Codec KAT (single-source encoder) ==="
+	@c++ -std=c++17 -O2 -Isrc tests/codec_kat.cpp -o bin/codec_kat
+	@bin/codec_kat > /tmp/codec_frame.txt 2>/dev/null \
+	  && diff -q /tmp/codec_frame.txt tests/golden_frame.txt >/dev/null \
+	  && echo "  PASS: impulse 171/133 + frame matches golden" \
+	  || (echo "  FAIL: codec drifted"; exit 1)
+
+
 # LEO Doppler stress test — worst case for satellite demodulator performance.
 #
 # Models the zenith crossing of an overhead LEO pass: a linear frequency ramp
@@ -260,4 +270,4 @@ test-doppler: all
 	   echo "✗ Coherent underperforms under Doppler — Costas loop investigation needed"; \
 	 fi
 
-.PHONY: all clean test test-raw test-server test-server-send test-rx test-coherent test-coherent-compare test-doppler
+.PHONY: all clean test test-codec test-raw test-server test-server-send test-rx test-coherent test-coherent-compare test-doppler
