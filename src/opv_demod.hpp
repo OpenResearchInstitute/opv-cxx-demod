@@ -1264,7 +1264,7 @@ public:
         int* cur = buf0;
         int* nxt = buf1;
         for (int s = 0; s < NUM_STATES; ++s) cur[s] = 0x7FFFFFFF;
-        cur[0] = 0;
+        cur[0] = 0;   // zero-terminated decode assumes start state 0
 
         for (size_t t = 0; t < FRAME_BITS; ++t) {
             const int sg1 = soft_in[t * 2], sg2 = soft_in[t * 2 + 1];
@@ -1300,6 +1300,50 @@ public:
             s = (decisions_[t][s] == 0) ? s / 2 : s / 2 + 32;
         }
 
+        return cur[best];
+    }
+
+
+
+    // Wrap-around Viterbi (WAVA) for a TAIL-BITING (ring) codeword.
+    // The frame is circular, so its true neighbours are its own ends: prepend the
+    // last W symbol-pairs and append the first W, decode the K+2W stream, and keep
+    // the MIDDLE K bits -- every one then has real context on both sides (no seam,
+    // no tail-floor). W must exceed traceback convergence (~5*(K_c-1) ≈ 30).
+    static constexpr int WAVA_W   = 48;
+    static constexpr int WRAP_BITS = FRAME_BITS + 2 * WAVA_W;   // 1168
+
+    int decode_tailbiting(const std::array<int, ENCODED_BITS>& soft_in,
+                          std::array<uint8_t, FRAME_BITS>& bits_out) {
+        std::vector<std::array<uint8_t, NUM_STATES>> wdec(WRAP_BITS);
+        int cur[NUM_STATES], nxt[NUM_STATES];
+        for (int s = 0; s < NUM_STATES; ++s) cur[s] = 0;   // WAVA: start state unknown -> all states equal
+
+        for (int t = 0; t < WRAP_BITS; ++t) {
+            int src = t - WAVA_W;                     // wrapped index -> frame symbol-pair index
+            if (src < 0)                    src += FRAME_BITS;   // head wrap (from the tail)
+            else if (src >= (int)FRAME_BITS) src -= FRAME_BITS;  // tail wrap (from the head)
+            const int sg1 = soft_in[src*2], sg2 = soft_in[src*2 + 1];
+            const int bmtab[4] = { sg1 + sg2, sg1 + (SOFT_MAX - sg2),
+                               (SOFT_MAX - sg1) + sg2, (SOFT_MAX - sg1) + (SOFT_MAX - sg2) };
+            auto& dec = wdec[t];
+            for (int s = 0; s < NUM_STATES; ++s) {
+                const int p0 = pred0_[s], p1 = pred1_[s];
+                const int bm0 = bmtab[pat0_[s]], bm1 = bmtab[pat1_[s]];
+                const int m0 = (cur[p0] < 0x7FFFFFF0) ? cur[p0] + bm0 : 0x7FFFFFFF;
+                const int m1 = (cur[p1] < 0x7FFFFFF0) ? cur[p1] + bm1 : 0x7FFFFFFF;
+                if (m0 <= m1) { nxt[s] = m0; dec[s] = 0; }
+                else          { nxt[s] = m1; dec[s] = 1; }
+            }
+            for (int s = 0; s < NUM_STATES; ++s) cur[s] = nxt[s];
+        }
+        int best = 0;
+        for (int s = 1; s < NUM_STATES; ++s) if (cur[s] < cur[best]) best = s;
+
+        std::vector<uint8_t> full(WRAP_BITS);
+        int s = best;
+        for (int t = WRAP_BITS - 1; t >= 0; --t) { full[t] = s % 2; s = (wdec[t][s] == 0) ? s/2 : s/2 + 32; }
+        for (int i = 0; i < (int)FRAME_BITS; ++i) bits_out[i] = full[WAVA_W + i];   // keep the middle K
         return cur[best];
     }
 
@@ -1352,7 +1396,7 @@ private:
 
         // Viterbi
         std::array<uint8_t, FRAME_BITS> bits;
-        int metric = vit_.decode(deint, bits);
+        int metric = vit_.decode_tailbiting(deint, bits);
 
         // Pack
         std::array<uint8_t, FRAME_BYTES> packed;
@@ -1729,3 +1773,4 @@ public:
 private:
     std::vector<SingleStreamDecodeReceiver> rx_;
 };
+

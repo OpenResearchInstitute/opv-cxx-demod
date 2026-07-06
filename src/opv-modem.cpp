@@ -40,6 +40,7 @@
  * SPDX-License-Identifier: CERN-OHL-S-2.0
  */
 
+#include <cassert>
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
@@ -207,6 +208,7 @@ private:
 class ConvEncoder {
 public:
     void reset() { sr = 0; }
+    uint8_t get_state() const { return sr; }
     
     void encode_bit(uint8_t in, uint8_t& g1, uint8_t& g2) {
         uint8_t state = (in << 6) | sr;
@@ -241,26 +243,38 @@ void interleave(encoded_bits_t& bits) {
 
 encoded_bits_t encode_frame(const frame_t& payload) {
     LFSR lfsr; lfsr.reset();
-    ConvEncoder conv; conv.reset();
+    ConvEncoder conv;
     encoded_bits_t encoded = {};
-    size_t out_idx = 0;
     
     std::array<uint8_t, FRAME_BYTES> randomized;
     for (size_t i = 0; i < FRAME_BYTES; ++i) {
         randomized[i] = payload[i] ^ lfsr.next_byte();
     }
     
+    // ---- TAIL-BITING pass 1: encode from zero to discover the end state (discard) --
+    conv.reset();
     for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
         uint8_t byte = randomized[byte_idx];
         for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
             uint8_t g1, g2;
-            uint8_t in_bit = (byte >> bit_pos) & 1;
-            conv.encode_bit(in_bit, g1, g2);
+            conv.encode_bit((byte >> bit_pos) & 1, g1, g2);
+        }
+    }
+    uint8_t seed = conv.get_state();     // = tail-biting start state
+
+    // ---- pass 2: real encode, continuing from the seeded state (NO reset) --------
+    size_t out_idx = 0;
+    for (int byte_idx = FRAME_BYTES - 1; byte_idx >= 0; --byte_idx) {
+        uint8_t byte = randomized[byte_idx];
+        for (int bit_pos = 7; bit_pos >= 0; --bit_pos) {
+            uint8_t g1, g2;
+            conv.encode_bit((byte >> bit_pos) & 1, g1, g2);
             encoded[out_idx++] = g1;
             encoded[out_idx++] = g2;
         }
     }
-    
+    assert(conv.get_state() == seed);    // ring-closure check
+
     interleave(encoded);
     return encoded;
 }
