@@ -61,7 +61,7 @@ clean:
 	rm -rf bin
 
 # Basic loopback test (mod → demod)
-test: all test-codec
+test: all test-codec test-sync-resolver
 	@echo "=== Pipe Loopback Test ==="
 	@$(BINDIR)/opv-mod -S W5NYV -B 5 | $(BINDIR)/opv-demod -s 2>&1 | grep -E "Station|Token|Summary"
 
@@ -187,6 +187,11 @@ test-codec: all
 	  && diff -q /tmp/codec_frame.txt tests/golden_frame.txt >/dev/null \
 	  && echo "  PASS: impulse 171/133 + frame matches golden" \
 	  || (echo "  FAIL: codec drifted"; exit 1)
+
+test-sync-resolver: | $(BINDIR)
+	@echo "=== Sync hypothesis resolver ==="
+	@$(CXX) $(CXXFLAGS) -Isrc tests/sync_resolver.cpp -o $(BINDIR)/sync_resolver
+	@$(BINDIR)/sync_resolver
 
 
 # LEO Doppler stress test — worst case for satellite demodulator performance.

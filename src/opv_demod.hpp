@@ -1144,28 +1144,7 @@ public:
     // is where the protocol's sync knowledge lives -- NOT in the demodulator, so
     // the demod stays reusable under a different framing.
     static std::vector<double> resolve(const std::vector<double>& dec0,
-                                       const std::vector<double>& dec1) {
-        double pat[SYNC_BITS];
-        for (size_t i = 0; i < SYNC_BITS; ++i) {
-            int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
-            pat[i] = (bit == 1) ? -1.0 : +1.0;
-        }
-        const std::vector<double>* str[2] = { &dec0, &dec1 };
-        double best = -1.0; int bp = 0; double bs = 1.0;
-        for (int p = 0; p < 2; ++p) {
-            const std::vector<double>& d = *str[p];
-            if (d.size() < SYNC_BITS) continue;
-            for (size_t pos = 0; pos + SYNC_BITS <= d.size(); ++pos) {
-                double sum = 0.0, en = 1e-9;
-                for (size_t j = 0; j < SYNC_BITS; ++j) { double v = d[pos+j]; sum += pat[j]*v; en += std::fabs(v); }
-                double c = sum / en;                       // normalized; sign = polarity
-                if (std::fabs(c) > best) { best = std::fabs(c); bp = p; bs = (c < 0) ? -1.0 : 1.0; }
-            }
-        }
-        std::vector<double> out = *str[bp];
-        if (bs < 0) for (double& x : out) x = -x;
-        return out;
-    }
+                                       const std::vector<double>& dec1);
 
 private:
     // Soft correlation: returns normalized correlation (-1 to +1)
@@ -1425,6 +1404,108 @@ public:
 private:
     ViterbiDecoder vit_;
 };
+
+inline std::vector<double> SyncTracker::resolve(const std::vector<double>& dec0,
+                                                const std::vector<double>& dec1) {
+    std::array<double, SYNC_BITS> pattern;
+    for (size_t i = 0; i < SYNC_BITS; ++i) {
+        const int bit = (SYNC_WORD >> (SYNC_BITS - 1 - i)) & 1;
+        pattern[i] = (bit == 1) ? -1.0 : +1.0;
+    }
+
+    struct Hypothesis {
+        const std::vector<double>* stream = nullptr;
+        size_t sync_pos = 0;
+        double polarity = 1.0;
+        double correlation = -1.0;
+        int metric = -1;
+    };
+
+    const std::vector<double>* streams[2] = {&dec0, &dec1};
+    std::array<Hypothesis, 2> hypotheses;
+    bool have_decodable_hypothesis = false;
+
+    const auto find_peak = [&pattern](const std::vector<double>& stream,
+                                      size_t last_sync) {
+        Hypothesis hypothesis;
+        hypothesis.stream = &stream;
+        for (size_t pos = 0; pos <= last_sync; ++pos) {
+            double sum = 0.0;
+            double energy = 1e-9;
+            for (size_t j = 0; j < SYNC_BITS; ++j) {
+                const double value = stream[pos + j];
+                sum += pattern[j] * value;
+                energy += std::fabs(value);
+            }
+            const double correlation = sum / energy;
+            if (std::fabs(correlation) > hypothesis.correlation) {
+                hypothesis.sync_pos = pos;
+                hypothesis.polarity = (correlation < 0.0) ? -1.0 : 1.0;
+                hypothesis.correlation = std::fabs(correlation);
+            }
+        }
+        return hypothesis;
+    };
+
+    for (int parity = 0; parity < 2; ++parity) {
+        const std::vector<double>& stream = *streams[parity];
+
+        // A candidate needs a complete encoded frame after its sync word. A
+        // peak at the end of a capture cannot be verified and must not displace
+        // an earlier, decodable peak.
+        if (stream.size() < SYNC_BITS + ENCODED_BITS) continue;
+        const size_t last_sync = stream.size() - SYNC_BITS - ENCODED_BITS;
+        Hypothesis& hypothesis = hypotheses[parity];
+        hypothesis = find_peak(stream, last_sync);
+
+        std::array<double, ENCODED_BITS> payload;
+        const size_t payload_pos = hypothesis.sync_pos + SYNC_BITS;
+        for (size_t i = 0; i < ENCODED_BITS; ++i)
+            payload[i] = hypothesis.polarity * stream[payload_pos + i];
+
+        FrameDecoder decoder;
+        std::array<uint8_t, FRAME_BYTES> decoded;
+        hypothesis.metric = decoder.decode(payload.data(), decoded);
+        have_decodable_hypothesis |= hypothesis.metric >= 0;
+    }
+
+    if (have_decodable_hypothesis) {
+        const Hypothesis* best = nullptr;
+        for (const Hypothesis& hypothesis : hypotheses) {
+            if (hypothesis.metric < 0) continue;
+            if (best == nullptr || hypothesis.metric < best->metric ||
+                (hypothesis.metric == best->metric &&
+                 hypothesis.correlation > best->correlation)) {
+                best = &hypothesis;
+            }
+        }
+        std::vector<double> out = *best->stream;
+        if (best->polarity < 0.0)
+            for (double& value : out) value = -value;
+        return out;
+    }
+
+    // Preserve the correlation-only behavior for short captures and
+    // zero-energy payloads where no complete frame can be decoded yet.
+    double best_correlation = -1.0;
+    int best_parity = 0;
+    double best_polarity = 1.0;
+    for (int parity = 0; parity < 2; ++parity) {
+        const std::vector<double>& stream = *streams[parity];
+        if (stream.size() < SYNC_BITS) continue;
+        const Hypothesis hypothesis = find_peak(stream, stream.size() - SYNC_BITS);
+        if (hypothesis.correlation > best_correlation) {
+            best_correlation = hypothesis.correlation;
+            best_parity = parity;
+            best_polarity = hypothesis.polarity;
+        }
+    }
+
+    std::vector<double> out = *streams[best_parity];
+    if (best_polarity < 0.0)
+        for (double& value : out) value = -value;
+    return out;
+}
 
 //------------------------------------------------------------------------------
 // ChannelReceiver - high-level per-channel orchestration (streaming)
@@ -1773,4 +1854,3 @@ public:
 private:
     std::vector<SingleStreamDecodeReceiver> rx_;
 };
-
