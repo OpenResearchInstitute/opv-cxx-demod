@@ -29,6 +29,10 @@
 #include <unistd.h>
 #include <cassert>
 #include "opv_codec.hpp"
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 // =============================================================================
 // PARAMETERS
@@ -329,7 +333,13 @@ void usage(const char* prog) {
     exit(1);
 }
 
+
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
     std::string callsign;
     int bert_frames = 0;
     bool continuous = false;
@@ -350,6 +360,7 @@ int main(int argc, char* argv[]) {
             default: usage(argv[0]);
         }
     }
+
     
     // Validate mode selection
     if (raw_mode && bert_frames > 0) {
