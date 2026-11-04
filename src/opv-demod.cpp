@@ -25,6 +25,10 @@
 //------------------------------------------------------------------------------
 
 #include "opv_demod.hpp"
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 //------------------------------------------------------------------------------
 // Frame Display
@@ -65,7 +69,13 @@ void print_frame(int num, const std::array<uint8_t, FRAME_BYTES>& f, int metric,
 //------------------------------------------------------------------------------
 // Main
 //------------------------------------------------------------------------------
+
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
     bool quiet = false, raw = false, coherent = false, streaming = false;
     double afc_bw = 0.001;
     double pll_bw = 50.0;  // PLL bandwidth in Hz
